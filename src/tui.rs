@@ -2463,10 +2463,23 @@ fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-// The one cyan-bold accent this whole UI uses for "this needs your
-// attention": a focused pane's border, and -- unconditionally, see
+// The one blue-bold accent (#7fc8ff) this whole UI uses for "this needs
+// your attention": a focused pane's border, and -- unconditionally, see
 // floating_window below -- every floating window's border and title.
-const FLOAT_ACCENT: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const FLOAT_ACCENT: Style = Style::new()
+    .fg(Color::Rgb(0x7f, 0xc8, 0xff))
+    .add_modifier(Modifier::BOLD);
+
+// The selected row: reversed (bright) in the focused pane, a dim grey bar
+// in an unfocused one -- so the cursor stays visible everywhere but only
+// the active pane's cursor stands out.
+fn row_highlight(focused: bool) -> Style {
+    if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().bg(Color::Rgb(0x69, 0x69, 0x69))
+    }
+}
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
     let style = if focused {
@@ -2551,7 +2564,7 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) {
             "COLLECTIONS".to_string(),
             app.focus == Focus::Collections,
         ))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(row_highlight(app.focus == Focus::Collections));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -2656,7 +2669,7 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App) {
     )
     .header(header)
     .block(pane_block(title, app.focus == Focus::Entries))
-    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    .row_highlight_style(row_highlight(app.focus == Focus::Entries));
     frame.render_stateful_widget(table, area, &mut state);
 }
 

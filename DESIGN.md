@@ -1084,6 +1084,11 @@ reusing marks without introducing a new selection mechanism:
   clamp, ~30 columns, reachable only on a terminal already at `MIN_WIDTH`
   where every pane is already cramped).
 
+*(Later: the accent changed from terminal cyan to `#7fc8ff`, and the
+selected row in an unfocused pane became a dim grey bar instead of
+reversed, so the cursor marks the active pane. Read "cyan" below as
+"`FLOAT_ACCENT`".)*
+
 **Design spec: every floating window is cyan.** By the time the palette,
 confirm, and help popups existed, they'd each independently picked up the
 same `Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)` accent
