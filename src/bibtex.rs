@@ -218,7 +218,7 @@ fn from_biblatex(e: &BibEntry) -> Result<Entry, String> {
     // anyway, so the verbatim text is both simpler and lossless.
     entry.volume = e.get("volume").map(|c| c.format_verbatim());
     entry.pages = e.pages().ok().map(pages_to_string);
-    entry.doi = e.doi().ok();
+    entry.doi = e.doi().ok().map(|d| crate::doi::normalize_doi(&d));
     entry.url = e.url().ok();
     entry.abstract_text = e.abstract_().ok().map(|c| c.format_verbatim());
     entry.tags = e

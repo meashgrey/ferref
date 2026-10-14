@@ -1109,7 +1109,9 @@ impl EditField {
             }
             EditField::Volume => entry.volume = (!trimmed.is_empty()).then(|| trimmed.to_string()),
             EditField::Pages => entry.pages = (!trimmed.is_empty()).then(|| trimmed.to_string()),
-            EditField::Doi => entry.doi = (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            EditField::Doi => {
+                entry.doi = (!trimmed.is_empty()).then(|| crate::doi::normalize_doi(trimmed))
+            }
             EditField::Url => entry.url = (!trimmed.is_empty()).then(|| trimmed.to_string()),
             EditField::Abstract => {
                 entry.abstract_text = (!trimmed.is_empty()).then(|| trimmed.to_string())

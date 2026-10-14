@@ -18,6 +18,11 @@ interactive).
 With `--doi` or a lone `--url`, any other field you pass overrides the fetched
 value.
 
+`--doi` (on `add` and `edit`, and the TUI's DOI field) also accepts a URL
+containing the DOI, such as `https://doi.org/10.1038/nature12373` or a
+publisher link with `/10.` in its path, and a `doi:` prefix. Either way only
+the bare `10.…` part is stored.
+
 ## Viewing and searching
 
 | Command | What it does |

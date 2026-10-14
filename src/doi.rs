@@ -325,6 +325,26 @@ pub fn download_pdf(url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Accepts a DOI pasted as a URL (`https://doi.org/10.1038/x`, a publisher
+/// link like `.../doi/full/10.1002/x`) or with a `doi:` prefix, and returns
+/// the bare `10.` form. Anything else comes back trimmed but otherwise
+/// unchanged, so `validate_doi` still gets to reject it.
+pub fn normalize_doi(input: &str) -> String {
+    let s = input.trim();
+    if s.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("doi:")) {
+        return s[4..].trim().to_string();
+    }
+    if !s.contains("://") {
+        return s.to_string();
+    }
+    let Some(start) = s.find("/10.") else {
+        return s.to_string();
+    };
+    let doi = &s[start + 1..];
+    let doi = doi.split(['?', '#']).next().unwrap_or(doi);
+    doi.replace("%2F", "/").replace("%2f", "/")
+}
+
 // percent_encode deliberately leaves `/` literal, because a DOI's slashes are
 // real path separators to Crossref. That makes `..` a path segment rather than
 // text, so a DOI like "10.1/../../x" would walk Crossref's URL path. It stays
@@ -1724,6 +1744,20 @@ mod tests {
             resolve_location(&root_base, "rel").unwrap(),
             "https://host.example/rel"
         );
+    }
+
+    #[test]
+    fn normalize_doi_strips_url_and_prefix() {
+        assert_eq!(normalize_doi("https://doi.org/10.1038/nature12373"), "10.1038/nature12373");
+        assert_eq!(normalize_doi(" http://dx.doi.org/10.1103/X.1?via=a#b "), "10.1103/X.1");
+        assert_eq!(
+            normalize_doi("https://onlinelibrary.wiley.com/doi/full/10.1002/abc.123"),
+            "10.1002/abc.123"
+        );
+        assert_eq!(normalize_doi("https://doi.org/10.1000%2Fxyz"), "10.1000/xyz");
+        assert_eq!(normalize_doi("DOI: 10.1000/xyz"), "10.1000/xyz");
+        assert_eq!(normalize_doi("10.1000/xyz"), "10.1000/xyz");
+        assert_eq!(normalize_doi("https://example.com/paper"), "https://example.com/paper");
     }
 
     #[test]

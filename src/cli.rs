@@ -42,7 +42,8 @@ pub enum Command {
         volume: Option<String>,
         #[arg(long)]
         pages: Option<String>,
-        #[arg(long)]
+        /// A bare DOI, or a doi.org/publisher URL containing one.
+        #[arg(long, value_parser = parse_doi)]
         doi: Option<String>,
         /// The paper's URL. Given alone -- with none of --type/--key/--title
         /// -- this is instead treated as a landing page to fetch from: reads
@@ -99,7 +100,8 @@ pub enum Command {
         volume: Option<String>,
         #[arg(long)]
         pages: Option<String>,
-        #[arg(long)]
+        /// A bare DOI, or a doi.org/publisher URL containing one.
+        #[arg(long, value_parser = parse_doi)]
         doi: Option<String>,
         #[arg(long)]
         url: Option<String>,
@@ -388,6 +390,10 @@ pub fn validate_cite_key(key: &str) -> Result<(), String> {
         return Err(format!("cite_key {key:?} cannot contain '{c}'"));
     }
     Ok(())
+}
+
+fn parse_doi(s: &str) -> Result<String, String> {
+    Ok(crate::doi::normalize_doi(s))
 }
 
 // A title is `NOT NULL` in the schema, but that alone still accepts "" or
