@@ -428,38 +428,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_author_last_and_first() {
-        let a = parse_author("Smith, John").unwrap();
-        assert_eq!(a.last_name, "Smith");
-        assert_eq!(a.first_name, Some("John".to_string()));
-    }
-
-    #[test]
-    fn parse_author_last_only() {
-        let a = parse_author("Smith").unwrap();
-        assert_eq!(a.last_name, "Smith");
-        assert_eq!(a.first_name, None);
-    }
-
-    #[test]
-    fn parse_author_trailing_comma_is_no_first_name() {
-        let a = parse_author("Smith,").unwrap();
-        assert_eq!(a.last_name, "Smith");
-        assert_eq!(a.first_name, None);
-    }
-
-    #[test]
-    fn parse_author_splits_on_first_comma_only() {
-        let a = parse_author("Smith, John, Jr.").unwrap();
-        assert_eq!(a.last_name, "Smith");
-        assert_eq!(a.first_name, Some("John, Jr.".to_string()));
-    }
-
-    #[test]
-    fn parse_author_trims_whitespace() {
-        let a = parse_author("  Smith  ,  John  ").unwrap();
-        assert_eq!(a.last_name, "Smith");
-        assert_eq!(a.first_name, Some("John".to_string()));
+    fn parse_author_cases() {
+        // (input, expected (last, first)); None = must be rejected. An empty
+        // last_name satisfies the NOT NULL column but is garbage data, so it
+        // has to be rejected before it reaches the DB.
+        type Expected = Option<(&'static str, Option<&'static str>)>;
+        let cases: [(&str, Expected); 10] = [
+            ("Smith, John", Some(("Smith", Some("John")))),
+            ("Smith", Some(("Smith", None))),
+            // A trailing comma is no first name.
+            ("Smith,", Some(("Smith", None))),
+            // Splits on the first comma only.
+            ("Smith, John, Jr.", Some(("Smith", Some("John, Jr.")))),
+            ("  Smith  ,  John  ", Some(("Smith", Some("John")))),
+            ("", None),
+            ("   ", None),
+            (",", None),
+            (",John", None),
+            ("  ,  John  ", None),
+        ];
+        for (raw, expect) in cases {
+            match (parse_author(raw), expect) {
+                (Ok(a), Some((last, first))) => {
+                    assert_eq!(a.last_name, last, "{raw:?}: last_name");
+                    assert_eq!(a.first_name.as_deref(), first, "{raw:?}: first_name");
+                }
+                (Err(_), None) => {}
+                (got, expect) => panic!("{raw:?}: got {got:?}, expected {expect:?}"),
+            }
+        }
     }
 
     #[test]
@@ -476,38 +473,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // An empty last_name satisfies the NOT NULL column but is garbage data,
-    // so it has to be rejected before it reaches the DB.
-    #[test]
-    fn parse_author_rejects_empty_last_name() {
-        for raw in ["", "   ", ",", ",John", "  ,  John  "] {
-            assert!(
-                parse_author(raw).is_err(),
-                "expected {raw:?} to be rejected"
-            );
-        }
-    }
-
     // M3: a key that reaches export unbraced as `@article{weird key,x,`
     // breaks every BibTeX parser, ferref's own import included.
     #[test]
     fn validate_cite_key_rejects_bad_keys() {
-        for raw in ["", "../../x", "weird key,x", "a{b", "a}b", "a(b", "a)b", "a\"b", "a#b", "a%b", "a'b", "a=b", "a\\b", "a/b"] {
+        for raw in [
+            "",
+            "../../x",
+            "weird key,x",
+            "a{b",
+            "a}b",
+            "a(b",
+            "a)b",
+            "a\"b",
+            "a#b",
+            "a%b",
+            "a'b",
+            "a=b",
+            "a\\b",
+            "a/b",
+        ] {
             assert!(
                 validate_cite_key(raw).is_err(),
                 "expected {raw:?} to be rejected"
             );
         }
         assert!(validate_cite_key("smith2020").is_ok());
-        assert!(validate_cite_key("smith2020b").is_ok());
-    }
-
-    // derive_cite_key only ever emits lowercased ASCII alphanumerics (plus
-    // "entry" as a fallback base), so it must always pass validation.
-    #[test]
-    fn validate_cite_key_accepts_derived_shape() {
-        for key in ["smith2020", "entry", "vandenberg1999z"] {
-            assert!(validate_cite_key(key).is_ok());
+        // derive_cite_key only ever emits lowercased ASCII alphanumerics
+        // (plus "entry" as a fallback base), so it must always pass.
+        for key in ["smith2020b", "entry", "vandenberg1999z"] {
+            assert!(
+                validate_cite_key(key).is_ok(),
+                "expected {key:?} to be accepted"
+            );
         }
     }
 

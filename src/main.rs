@@ -89,11 +89,7 @@ fn main() {
             Err(e) => die(&format!("failed to list entries: {e}")),
         },
 
-        Command::Show { cite_key, json } => match db::get_entry(&conn, &cite_key) {
-            Ok(Some(entry)) => output_entry(&entry, json),
-            Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
-            Err(e) => die(&format!("failed to fetch entry: {e}")),
-        },
+        Command::Show { cite_key, json } => output_entry(&require_entry(&conn, &cite_key), json),
 
         Command::Edit {
             cite_key,
@@ -108,52 +104,30 @@ fn main() {
             authors,
             json,
         } => {
-            let mut entry = match db::get_entry(&conn, &cite_key) {
-                Ok(Some(e)) => e,
-                Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
-                Err(e) => die(&format!("failed to fetch entry: {e}")),
-            };
+            let mut entry = require_entry(&conn, &cite_key);
 
-            // title is the one field here that isn't Option<T> on Entry (it's
-            // never null), so unlike every field below it this can't just
-            // reassign the whole Option -- it has to unwrap and move the
-            // String out of Some.
+            // title isn't Option<T> on Entry (it's never null), so it's set
+            // only when given rather than going through apply_manual_overrides.
             if let Some(title) = title {
                 if let Err(e) = cli::validate_title(&title) {
                     die(&e);
                 }
                 entry.title = title;
             }
-            if year.is_some() {
-                entry.year = year;
-            }
-            if journal.is_some() {
-                entry.journal = journal;
-            }
-            if volume.is_some() {
-                entry.volume = volume;
-            }
-            if pages.is_some() {
-                entry.pages = pages;
-            }
             if doi.is_some() {
                 entry.doi = doi;
             }
-            if url.is_some() {
-                entry.url = url;
-            }
-            if abstract_text.is_some() {
-                entry.abstract_text = abstract_text;
-            }
-            if !authors.is_empty() {
-                // Parse every author before assigning any, so one bad argument
-                // can't half-replace a good author list.
-                let parsed: Result<Vec<_>, _> =
-                    authors.iter().map(|a| cli::parse_author(a)).collect();
-                match parsed {
-                    Ok(list) => entry.authors = list,
-                    Err(e) => die(&e),
-                }
+            if let Err(e) = apply_manual_overrides(
+                &mut entry,
+                year,
+                journal,
+                volume,
+                pages,
+                abstract_text,
+                url,
+                authors,
+            ) {
+                die(&e);
             }
 
             if let Err(e) = db::update_entry(&conn, &entry) {
@@ -170,11 +144,7 @@ fn main() {
         }
 
         Command::Rm { cite_key, json } => {
-            match db::get_entry(&conn, &cite_key) {
-                Ok(Some(_)) => {}
-                Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
-                Err(e) => die(&format!("failed to fetch entry: {e}")),
-            }
+            require_entry(&conn, &cite_key);
             if let Err(e) = db::delete_entry(&conn, &cite_key) {
                 die(&format!("failed to delete entry: {e}"));
             }
@@ -190,16 +160,8 @@ fn main() {
             if keep == drop {
                 die("keep and drop must be different entries");
             }
-            let keep_id = match db::get_entry(&conn, &keep) {
-                Ok(Some(e)) => e.id.unwrap(),
-                Ok(None) => die(&format!("no entry found with cite_key '{keep}'")),
-                Err(e) => die(&format!("failed to fetch entry: {e}")),
-            };
-            let drop_id = match db::get_entry(&conn, &drop) {
-                Ok(Some(e)) => e.id.unwrap(),
-                Ok(None) => die(&format!("no entry found with cite_key '{drop}'")),
-                Err(e) => die(&format!("failed to fetch entry: {e}")),
-            };
+            let keep_id = require_entry(&conn, &keep).id.unwrap();
+            let drop_id = require_entry(&conn, &drop).id.unwrap();
             if let Err(e) = db::merge_entries(&conn, keep_id, drop_id) {
                 die(&format!("failed to merge entries: {e}"));
             }
@@ -215,57 +177,13 @@ fn main() {
             cite_key,
             tag,
             json,
-        } => {
-            let normalized = match db::normalize_tag(&tag) {
-                Ok(t) => t,
-                Err(e) => die(&format!("invalid tag: {e}")),
-            };
-            match db::add_tag(&conn, &cite_key, &normalized) {
-                Ok(changed) => {
-                    if json {
-                        let out = serde_json::json!({
-                            "cite_key": cite_key,
-                            "tag": normalized,
-                            "changed": changed,
-                        });
-                        emit_json(&out);
-                    } else if changed {
-                        emit(&format!("Tagged '{cite_key}' with '{normalized}'"));
-                    } else {
-                        emit(&format!("'{cite_key}' already tagged '{normalized}'"));
-                    }
-                }
-                Err(e) => die(&friendly(Some(&cite_key), "tag entry", e)),
-            }
-        }
+        } => cmd_tag(&conn, &cite_key, &tag, json, true),
 
         Command::Untag {
             cite_key,
             tag,
             json,
-        } => {
-            let normalized = match db::normalize_tag(&tag) {
-                Ok(t) => t,
-                Err(e) => die(&format!("invalid tag: {e}")),
-            };
-            match db::remove_tag(&conn, &cite_key, &normalized) {
-                Ok(changed) => {
-                    if json {
-                        let out = serde_json::json!({
-                            "cite_key": cite_key,
-                            "tag": normalized,
-                            "changed": changed,
-                        });
-                        emit_json(&out);
-                    } else if changed {
-                        emit(&format!("Untagged '{cite_key}' from '{normalized}'"));
-                    } else {
-                        emit(&format!("'{cite_key}' was not tagged '{normalized}'"));
-                    }
-                }
-                Err(e) => die(&friendly(Some(&cite_key), "untag entry", e)),
-            }
-        }
+        } => cmd_tag(&conn, &cite_key, &tag, json, false),
 
         Command::Search {
             author,
@@ -349,11 +267,7 @@ fn main() {
             // message as before -- attachments_for_cite_key alone would
             // instead report an empty Vec for an unknown cite_key, which
             // reads as "no attachments" rather than "no such entry".
-            match db::get_entry(&conn, &cite_key) {
-                Ok(Some(_)) => {}
-                Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
-                Err(e) => die(&format!("failed to fetch entry: {e}")),
-            };
+            require_entry(&conn, &cite_key);
             let attachments = match db::attachments_for_cite_key(&conn, &cite_key) {
                 Ok(a) => a,
                 Err(e) => die(&friendly(Some(&cite_key), "list attachments", e)),
@@ -421,7 +335,9 @@ fn main() {
                     emit(&format!("Opened '{path}'"));
                 }
                 for path in &cleaned {
-                    emit(&format!("removed dangling attachment '{path}' -- file no longer exists"));
+                    emit(&format!(
+                        "removed dangling attachment '{path}' -- file no longer exists"
+                    ));
                 }
             }
         }
@@ -657,9 +573,7 @@ fn cmd_add(
                         "Crossref has no record for DOI '{doi_value}'; using the page's own details instead"
                     ))
                 );
-                entry_from_page_metadata(
-                    page.as_ref().expect("doi_from_page implies page is Some"),
-                )
+                entry_from_page_metadata(page.as_ref().expect("doi_from_page implies page is Some"))
             }
             Err(e) => die(&format!(
                 "failed to fetch metadata for DOI '{doi_value}': {e}"
@@ -793,13 +707,17 @@ struct AttachOutcome {
 // Shared by attach_path_for_entry and land_downloaded_pdf (fetch, and
 // add --url's landing-page mode) rather than duplicated in each -- both are
 // write paths that add an attachment via db::attach.
-fn prune_dangling_attachments(conn: &rusqlite::Connection, cite_key: &str) -> Result<usize, String> {
+fn prune_dangling_attachments(
+    conn: &rusqlite::Connection,
+    cite_key: &str,
+) -> Result<usize, String> {
     let existing = db::attachments_for_cite_key(conn, cite_key)
         .map_err(|e| friendly(Some(cite_key), "list attachments", e))?;
     let mut pruned = 0usize;
     for (id, path) in existing {
         if !Path::new(&path).is_file() {
-            db::detach(conn, id).map_err(|e| friendly(Some(cite_key), "detach dangling attachment", e))?;
+            db::detach(conn, id)
+                .map_err(|e| friendly(Some(cite_key), "detach dangling attachment", e))?;
             pruned += 1;
         }
     }
@@ -894,10 +812,10 @@ fn cmd_attach(
             sanitize_control_chars(e)
         );
         std::process::exit(1);
-    } else if let Some(Ok(chars)) = &extraction {
-        if !json {
-            emit(&format!("Extracted {chars} characters from '{resolved}'"));
-        }
+    } else if let Some(Ok(chars)) = &extraction
+        && !json
+    {
+        emit(&format!("Extracted {chars} characters from '{resolved}'"));
     }
 }
 
@@ -1066,7 +984,10 @@ enum FetchOutcome {
 // source with a real network call of its own (PMC, bioRxiv) is never
 // reached once something earlier has already landed a PDF, or once the
 // overall deadline has passed.
-type CandidateSource = (&'static str, Box<dyn FnOnce() -> Result<Option<Vec<String>>, String>>);
+type CandidateSource = (
+    &'static str,
+    Box<dyn FnOnce() -> Result<Option<Vec<String>>, String>>,
+);
 
 // What trying one candidate URL came back with. `Retry` and `Fatal` are
 // both failures, but only `Retry` means "this candidate didn't pan out, try
@@ -1233,7 +1154,20 @@ fn short_download_reason(err: &str) -> (String, bool) {
     )
 }
 
+// <library root>/pdfs, created if missing.
+fn pdfs_dir() -> Result<PathBuf, String> {
+    let dir = config::library_root()?.join("pdfs");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+    Ok(dir)
+}
+
 const FETCH_DEADLINE: Duration = Duration::from_secs(60);
+
+// Appended to fetch's error when a candidate was bot-blocked; also stripped
+// back off by `summarize_fetch_error`.
+const BLOCKED_ADVICE: &str =
+    "; download a blocked one in a browser and use `ferref attach` instead";
 
 // Builds the ordered candidate list -- PMC, Unpaywall, arXiv, bioRxiv, OSF,
 // preprints.org -- as lazy thunks (see `CandidateSource`). Pulled out of
@@ -1259,8 +1193,11 @@ fn candidate_sources(
     let doi_for_preprints = doi_value.to_string();
     // `deadline` is `Copy`, so each `move` closure below captures its own
     // copy rather than fighting over one shared value.
-    let remaining_json_timeout =
-        move || deadline.saturating_duration_since(Instant::now()).min(doi::JSON_TIMEOUT);
+    let remaining_json_timeout = move || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(doi::JSON_TIMEOUT)
+    };
 
     vec![
         (
@@ -1282,8 +1219,7 @@ fn candidate_sources(
                 if !doi_for_biorxiv.starts_with("10.1101/") {
                     return Ok(None);
                 }
-                let timeout = deadline.saturating_duration_since(Instant::now()).min(doi::JSON_TIMEOUT);
-                doi::biorxiv_pdf_url(&doi_for_biorxiv, timeout)
+                doi::biorxiv_pdf_url(&doi_for_biorxiv, remaining_json_timeout())
                     .map(|opt| Some(opt.into_iter().collect()))
             }),
         ),
@@ -1293,9 +1229,7 @@ fn candidate_sources(
         ),
         (
             "preprints.org",
-            Box::new(move || {
-                Ok(doi::preprints_org_pdf_url(&doi_for_preprints).map(|u| vec![u]))
-            }),
+            Box::new(move || Ok(doi::preprints_org_pdf_url(&doi_for_preprints).map(|u| vec![u]))),
         ),
     ]
 }
@@ -1361,18 +1295,18 @@ fn fetch_pdf_for_entry(
     // resolver error below, same as any other source's.
     let mut is_oa = false;
     let mut pmcid: Option<String> = None;
-    let unpaywall_urls: Result<Vec<String>, String> = match doi::fetch_oa_pdf_url(
+    let unpaywall_urls: Result<Vec<String>, String> = doi::fetch_oa_pdf_url(
         &doi_value,
         &resolved_email,
-        deadline.saturating_duration_since(Instant::now()).min(doi::JSON_TIMEOUT),
-    ) {
-            Ok(oa) => {
-                is_oa = oa.is_oa;
-                pmcid = oa.pmcid;
-                Ok(oa.pdf_urls)
-            }
-            Err(e) => Err(e),
-        };
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(doi::JSON_TIMEOUT),
+    )
+    .map(|oa| {
+        is_oa = oa.is_oa;
+        pmcid = oa.pmcid;
+        oa.pdf_urls
+    });
 
     let sources = candidate_sources(&doi_value, pmcid, unpaywall_urls, deadline);
 
@@ -1380,11 +1314,11 @@ fn fetch_pdf_for_entry(
         let remaining = deadline.saturating_duration_since(Instant::now());
         let timeout = remaining.min(doi::DEFAULT_PDF_TIMEOUT);
         classify_download(doi::download_pdf(url, timeout), |bytes| {
-            land_pdf_bytes(conn, cite_key, bytes).map(|(path, id)| (path, id, false))
+            land_pdf_bytes(conn, cite_key, bytes)
         })
     })?;
 
-    let Some(((path_str, attachment_id, already_present), source)) = outcome.landed else {
+    let Some(((path_str, attachment_id), source)) = outcome.landed else {
         // Having no candidate anywhere, with every source giving a clean
         // "nothing here", is a normal, legitimate answer, not an error --
         // but a candidate that existed and failed every download, or a
@@ -1394,7 +1328,7 @@ fn fetch_pdf_for_entry(
         // open access".
         if outcome.any_download_attempted || outcome.any_resolver_error {
             let advice = if outcome.any_bot_blocked {
-                "; download a blocked one in a browser and use `ferref attach` instead"
+                BLOCKED_ADVICE
             } else {
                 ""
             };
@@ -1420,7 +1354,7 @@ fn fetch_pdf_for_entry(
     Ok(FetchOutcome::Downloaded {
         doi: doi_value,
         path: path_str,
-        already_present,
+        already_present: false,
         extraction,
         source: Some(source),
     })
@@ -1439,13 +1373,13 @@ fn summarize_fetch_error(cite_key: &str, e: &str) -> String {
         // an unresolved email -- those are already one line, show as-is.
         return e.to_string();
     };
-    let blocked_advice =
-        "; download a blocked one in a browser and use `ferref attach` instead";
-    let rest = rest.strip_suffix(blocked_advice).unwrap_or(rest);
+    let rest = rest.strip_suffix(BLOCKED_ADVICE).unwrap_or(rest);
     let attempts = rest.split("; ").filter(|s| !s.is_empty()).count();
     let blocked = rest.matches("blocked by a bot check").count();
     if blocked == 0 {
-        format!("no PDF could be downloaded ({attempts} copies tried) -- see `ferref fetch {cite_key}`")
+        format!(
+            "no PDF could be downloaded ({attempts} copies tried) -- see `ferref fetch {cite_key}`"
+        )
     } else {
         format!(
             "no PDF could be downloaded ({attempts} copies tried, {blocked} blocked by bot checks) -- see `ferref fetch {cite_key}`"
@@ -1530,12 +1464,11 @@ fn cmd_fetch(conn: &rusqlite::Connection, cite_key: String, email: Option<String
     }
 }
 
-// Roadmap item, scoped here: a read-only scan for attachment paths that no
-// longer resolve on disk (a moved/deleted file, or a hand-edited DB row --
-// the database is hand-editable by design, so this is a real, reachable
-// state, not just a defensive check). Doesn't touch the filesystem beyond
-// `Path::is_file`, and doesn't offer to fix anything -- that's future work
-// once the report itself has been useful for a while.
+// Scans for attachment paths that no longer resolve on disk (a moved/deleted
+// file, or a hand-edited DB row -- the database is hand-editable by design,
+// so this is a real, reachable state, not just a defensive check). Doesn't
+// touch the filesystem beyond `Path::is_file`; with `fix`, detaches the
+// broken rows.
 fn cmd_doctor(conn: &rusqlite::Connection, json: bool, fix: bool) {
     let attachments = match db::all_attachment_paths(conn) {
         Ok(a) => a,
@@ -1602,6 +1535,89 @@ fn cmd_doctor(conn: &rusqlite::Connection, json: bool, fix: bool) {
     }
 }
 
+// Shared output for the add/remove toggles (tag/untag, collection add/rm):
+// `fields` is the --json object minus "changed", which is appended here.
+fn emit_changed(
+    json: bool,
+    changed: bool,
+    mut fields: serde_json::Value,
+    done: String,
+    unchanged: String,
+) {
+    if json {
+        fields["changed"] = serde_json::json!(changed);
+        emit_json(&fields);
+    } else {
+        emit(if changed { &done } else { &unchanged });
+    }
+}
+
+fn cmd_tag(conn: &rusqlite::Connection, cite_key: &str, tag: &str, json: bool, add: bool) {
+    let normalized = match db::normalize_tag(tag) {
+        Ok(t) => t,
+        Err(e) => die(&format!("invalid tag: {e}")),
+    };
+    let (result, action, done, unchanged) = if add {
+        (
+            db::add_tag(conn, cite_key, &normalized),
+            "tag entry",
+            format!("Tagged '{cite_key}' with '{normalized}'"),
+            format!("'{cite_key}' already tagged '{normalized}'"),
+        )
+    } else {
+        (
+            db::remove_tag(conn, cite_key, &normalized),
+            "untag entry",
+            format!("Untagged '{cite_key}' from '{normalized}'"),
+            format!("'{cite_key}' was not tagged '{normalized}'"),
+        )
+    };
+    match result {
+        Ok(changed) => emit_changed(
+            json,
+            changed,
+            serde_json::json!({ "cite_key": cite_key, "tag": normalized }),
+            done,
+            unchanged,
+        ),
+        Err(e) => die(&friendly(Some(cite_key), action, e)),
+    }
+}
+
+fn cmd_collection_membership(
+    conn: &rusqlite::Connection,
+    path: &str,
+    cite_key: &str,
+    json: bool,
+    add: bool,
+) {
+    let (result, action, done, unchanged) = if add {
+        (
+            db::add_to_collection(conn, path, cite_key),
+            "add entry to collection",
+            format!("Added '{cite_key}' to '{path}'"),
+            format!("'{cite_key}' is already in '{path}'"),
+        )
+    } else {
+        (
+            db::remove_from_collection(conn, path, cite_key),
+            "remove entry from collection",
+            format!("Removed '{cite_key}' from '{path}'"),
+            format!("'{cite_key}' was not in '{path}'"),
+        )
+    };
+    match result {
+        Ok(changed) => emit_changed(
+            json,
+            changed,
+            serde_json::json!({ "path": path, "cite_key": cite_key }),
+            done,
+            unchanged,
+        ),
+        Err(e) => die(&friendly(Some(cite_key), action, e)),
+    }
+}
+
 fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionCommand) {
     use cli::CollectionCommand;
 
@@ -1659,49 +1675,13 @@ fn dispatch_collection(conn: &rusqlite::Connection, command: cli::CollectionComm
             path,
             cite_key,
             json,
-        } => match db::add_to_collection(conn, &path, &cite_key) {
-            Ok(changed) => {
-                if json {
-                    let out = serde_json::json!({
-                        "path": path,
-                        "cite_key": cite_key,
-                        "changed": changed,
-                    });
-                    emit_json(&out);
-                } else if changed {
-                    emit(&format!("Added '{cite_key}' to '{path}'"));
-                } else {
-                    emit(&format!("'{cite_key}' is already in '{path}'"));
-                }
-            }
-            Err(e) => die(&friendly(Some(&cite_key), "add entry to collection", e)),
-        },
+        } => cmd_collection_membership(conn, &path, &cite_key, json, true),
 
         CollectionCommand::Rm {
             path,
             cite_key,
             json,
-        } => match db::remove_from_collection(conn, &path, &cite_key) {
-            Ok(changed) => {
-                if json {
-                    let out = serde_json::json!({
-                        "path": path,
-                        "cite_key": cite_key,
-                        "changed": changed,
-                    });
-                    emit_json(&out);
-                } else if changed {
-                    emit(&format!("Removed '{cite_key}' from '{path}'"));
-                } else {
-                    emit(&format!("'{cite_key}' was not in '{path}'"));
-                }
-            }
-            Err(e) => die(&friendly(
-                Some(&cite_key),
-                "remove entry from collection",
-                e,
-            )),
-        },
+        } => cmd_collection_membership(conn, &path, &cite_key, json, false),
 
         CollectionCommand::Mv {
             path,
@@ -1850,6 +1830,14 @@ fn sanitize_control_chars(s: &str) -> String {
         .collect()
 }
 
+fn require_entry(conn: &rusqlite::Connection, cite_key: &str) -> Entry {
+    match db::get_entry(conn, cite_key) {
+        Ok(Some(e)) => e,
+        Ok(None) => die(&format!("no entry found with cite_key '{cite_key}'")),
+        Err(e) => die(&format!("failed to fetch entry: {e}")),
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("Error: {}", sanitize_control_chars(msg));
     std::process::exit(1);
@@ -1867,19 +1855,6 @@ fn emit(s: &str) {
         }
         die(&format!("failed writing to stdout: {e}"));
     }
-}
-
-#[test]
-fn test_sanitize_control_chars() {
-    // ESC (clipboard-setting OSC 52 sequence), a C1 control (U+009B, CSI),
-    // and \r are all stripped; \n and \t survive.
-    let raw = "Title\x1b]52;c;AAAA\x07\u{9b}2J\r\nLine two\tindented";
-    assert_eq!(
-        sanitize_control_chars(raw),
-        "Title]52;c;AAAA2J\nLine two\tindented"
-    );
-    // Ordinary text is untouched.
-    assert_eq!(sanitize_control_chars("plain text"), "plain text");
 }
 
 // All JSON output goes through here, streamed straight to stdout rather than
@@ -1984,7 +1959,7 @@ fn add_pdf_from_page(
     cite_key: &str,
     pdf_url: &str,
 ) -> Result<String, String> {
-    let (path, attachment_id, _) = land_downloaded_pdf(conn, cite_key, pdf_url)?;
+    let (path, attachment_id) = land_downloaded_pdf(conn, cite_key, pdf_url)?;
     let extracted = text::extract_text(Path::new(&path))
         .and_then(|text| save_extracted(conn, attachment_id, &text));
     match extracted {
@@ -2004,19 +1979,19 @@ fn already_landed_pdf(
     cite_key: &str,
 ) -> Result<Option<(String, i64)>, String> {
     let filename = doi::sanitize_filename(cite_key)?;
-    let root = config::library_root()?;
-    let dir = root.join("pdfs");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+    let dir = pdfs_dir()?;
 
     let (target, already_present) = pdf_target(conn, cite_key, &dir, &filename, "pdf", None)?;
     if !already_present {
         return Ok(None);
     }
 
-    let abs = target
-        .canonicalize()
-        .map_err(|e| format!("failed to resolve saved PDF path '{}': {e}", target.display()))?;
+    let abs = target.canonicalize().map_err(|e| {
+        format!(
+            "failed to resolve saved PDF path '{}': {e}",
+            target.display()
+        )
+    })?;
     let path_str = abs
         .to_str()
         .ok_or_else(|| format!("path {} is not valid UTF-8", abs.display()))?
@@ -2042,10 +2017,7 @@ fn land_pdf_bytes(
     bytes: &[u8],
 ) -> Result<(String, i64), String> {
     let filename = doi::sanitize_filename(cite_key)?;
-    let root = config::library_root()?;
-    let dir = root.join("pdfs");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+    let dir = pdfs_dir()?;
 
     // B9: the download already happened before this is called, so
     // discarding it on a name conflict (another process claiming a name in
@@ -2107,14 +2079,13 @@ fn land_downloaded_pdf(
     conn: &rusqlite::Connection,
     cite_key: &str,
     pdf_url: &str,
-) -> Result<(String, i64, bool), String> {
-    if let Some((path, attachment_id)) = already_landed_pdf(conn, cite_key)? {
-        return Ok((path, attachment_id, true));
+) -> Result<(String, i64), String> {
+    if let Some(found) = already_landed_pdf(conn, cite_key)? {
+        return Ok(found);
     }
     let bytes = doi::download_pdf(pdf_url, doi::DEFAULT_PDF_TIMEOUT)
         .map_err(|e| format!("failed to download PDF: {e}"))?;
-    let (path, attachment_id) = land_pdf_bytes(conn, cite_key, &bytes)?;
-    Ok((path, attachment_id, false))
+    land_pdf_bytes(conn, cite_key, &bytes)
 }
 
 // Picks where a PDF goes under ./pdfs/, and says whether the file is already
@@ -2263,10 +2234,7 @@ fn copy_into_library(
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_else(|| "pdf".to_string());
 
-    let root = config::library_root()?;
-    let dir = root.join("pdfs");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("failed to create '{}': {e}", dir.display()))?;
+    let dir = pdfs_dir()?;
 
     // Choosing the name and writing it has to be one indivisible step.
     // `pick_target` decides a name is free by looking, and two attaches racing
@@ -2496,19 +2464,12 @@ fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-// Finds up to `max_matches` non-overlapping, ASCII-case-insensitive
-// occurrences of `query` in `text`, each surrounded by up to
-// `context_bytes` bytes of context (rounded outward to a char boundary --
-// hence "bytes", not "chars", in the name). Returns the capped snippets
-// plus the *true* total occurrence count, so a caller can report "+N more"
-// beyond what's shown. ASCII-only case folding matches what the SQL LIKE
-// filter upstream already applied, so results stay consistent with it.
-//
-// `to_ascii_lowercase` only maps 'A'-'Z' and never changes a string's byte
-// length or the position of any other byte, so offsets found in the
-// lowercased copy are valid offsets into the original `text` -- this is
-// what makes slicing `text` (not the lowercased copy) at those offsets
-// correct, snippets keep the source's original casing.
+// Finds up to `max_matches` non-overlapping, case-insensitive occurrences of
+// `query` in `text`, each surrounded by up to `context_bytes` bytes of
+// context (rounded outward to a char boundary -- hence "bytes", not "chars",
+// in the name). Returns the capped snippets plus the *true* total occurrence
+// count, so a caller can report "+N more" beyond what's shown. Snippets keep
+// the source's original casing.
 // B1: SQLite's FTS5 MATCH (the SQL-layer check that gates whether this
 // function even runs) does full Unicode case folding, so an ASCII-only
 // lowercase here used to disagree with it -- "café" (lowercase é) wouldn't
@@ -2594,8 +2555,8 @@ fn find_snippets(
 // Re-checks per attachment here (not just per entry): a multi-attachment
 // entry can have one matching file and one that doesn't, and only the
 // matching one belongs in the output. An entry whose SQL match doesn't
-// reproduce in Rust (shouldn't happen, but ASCII vs. LIKE case-folding
-// could in principle disagree), or whose attachment lookup itself fails
+// reproduce in Rust (shouldn't happen, but FTS5's and Rust's
+// case-folding could in principle disagree), or whose attachment lookup itself fails
 // (shouldn't happen either -- the entry came from this same connection a
 // moment ago), is skipped rather than shown empty or panicking.
 fn text_search_results(
@@ -2668,89 +2629,146 @@ fn format_text_search_result(result: &TextSearchResult) -> String {
 mod tests {
     use super::*;
 
-    // B4 regression: --doi/scrape --url mode used to discard --abstract/
-    // --journal/--volume/--pages/--author outright (only --url was fixed
-    // earlier). An explicit flag must override whatever Crossref/the page
-    // supplied.
     #[test]
-    fn apply_manual_overrides_lets_explicit_flags_win_over_fetched_values() {
-        let mut entry = Entry::new(
-            "article".to_string(),
-            "smith2024".to_string(),
-            "Fetched Title".to_string(),
+    fn test_sanitize_control_chars() {
+        // ESC (clipboard-setting OSC 52 sequence), a C1 control (U+009B, CSI),
+        // and \r are all stripped; \n and \t survive.
+        let raw = "Title\x1b]52;c;AAAA\x07\u{9b}2J\r\nLine two\tindented";
+        assert_eq!(
+            sanitize_control_chars(raw),
+            "Title]52;c;AAAA2J\nLine two\tindented"
         );
-        entry.year = Some(2020);
-        entry.journal = Some("Fetched Journal".to_string());
-        entry.volume = Some("1".to_string());
-        entry.pages = Some("1-2".to_string());
-        entry.abstract_text = Some("Fetched abstract".to_string());
-        entry.url = Some("https://fetched.example".to_string());
-        entry.add_author(Author::new("Fetched".to_string(), Some("Author".to_string())));
-
-        apply_manual_overrides(
-            &mut entry,
-            Some(1999),
-            Some("MY JOURNAL".to_string()),
-            Some("9".to_string()),
-            Some("100-200".to_string()),
-            Some("MY ABSTRACT".to_string()),
-            Some("https://mine.example".to_string()),
-            vec!["Doe, Jane".to_string()],
-        )
-        .unwrap();
-
-        assert_eq!(entry.year, Some(1999));
-        assert_eq!(entry.journal, Some("MY JOURNAL".to_string()));
-        assert_eq!(entry.volume, Some("9".to_string()));
-        assert_eq!(entry.pages, Some("100-200".to_string()));
-        assert_eq!(entry.abstract_text, Some("MY ABSTRACT".to_string()));
-        assert_eq!(entry.url, Some("https://mine.example".to_string()));
-        assert_eq!(entry.authors.len(), 1);
-        assert_eq!(entry.authors[0].last_name, "Doe");
-        assert_eq!(entry.authors[0].first_name, Some("Jane".to_string()));
+        // Ordinary text is untouched.
+        assert_eq!(sanitize_control_chars("plain text"), "plain text");
     }
 
-    // No override flags given: fetched/scraped values must be left alone,
-    // including the author list (an empty --author vector is a no-op, not
-    // "wipe the authors Crossref found").
+    // Each row applies the override flags to the same "fetched" entry and
+    // checks every field after; `expect: None` means the call must fail.
     #[test]
-    fn apply_manual_overrides_is_a_no_op_when_nothing_is_overridden() {
-        let mut entry = Entry::new(
-            "article".to_string(),
-            "smith2024".to_string(),
-            "Fetched Title".to_string(),
-        );
-        entry.year = Some(2020);
-        entry.journal = Some("Fetched Journal".to_string());
-        entry.add_author(Author::new("Fetched".to_string(), Some("Author".to_string())));
+    #[allow(clippy::type_complexity)] // a table of tuples
+    fn apply_manual_overrides_cases() {
+        type Authors = &'static [(&'static str, Option<&'static str>)];
+        struct Exp {
+            year: Option<i32>,
+            journal: Option<&'static str>,
+            volume: Option<&'static str>,
+            pages: Option<&'static str>,
+            abstract_text: Option<&'static str>,
+            url: Option<&'static str>,
+            authors: Authors,
+        }
+        let fetched = Exp {
+            year: Some(2020),
+            journal: Some("Fetched Journal"),
+            volume: Some("1"),
+            pages: Some("1-2"),
+            abstract_text: Some("Fetched abstract"),
+            url: Some("https://fetched.example"),
+            authors: &[("Fetched", Some("Author"))],
+        };
+        let s = |v: &str| Some(v.to_string());
+        let cases: Vec<(
+            &str,
+            [Option<String>; 5],
+            Option<i32>,
+            Vec<String>,
+            Option<Exp>,
+        )> = vec![
+            // B4 regression: --doi/scrape --url mode used to discard
+            // --abstract/--journal/--volume/--pages/--author outright (only
+            // --url was fixed earlier). An explicit flag must override
+            // whatever Crossref/the page supplied.
+            (
+                "explicit flags win",
+                [
+                    s("MY JOURNAL"),
+                    s("9"),
+                    s("100-200"),
+                    s("MY ABSTRACT"),
+                    s("https://mine.example"),
+                ],
+                Some(1999),
+                vec!["Doe, Jane".to_string()],
+                Some(Exp {
+                    year: Some(1999),
+                    journal: Some("MY JOURNAL"),
+                    volume: Some("9"),
+                    pages: Some("100-200"),
+                    abstract_text: Some("MY ABSTRACT"),
+                    url: Some("https://mine.example"),
+                    authors: &[("Doe", Some("Jane"))],
+                }),
+            ),
+            // No override flags given: fetched/scraped values must be left
+            // alone, including the author list (an empty --author vector is
+            // a no-op, not "wipe the authors Crossref found").
+            (
+                "no-op when nothing overridden",
+                [None, None, None, None, None],
+                None,
+                vec![],
+                Some(fetched),
+            ),
+            // A malformed --author must fail loudly, same as the
+            // fully-manual path.
+            (
+                "unparsable author",
+                [None, None, None, None, None],
+                None,
+                vec!["   ".to_string()],
+                None,
+            ),
+        ];
 
-        apply_manual_overrides(&mut entry, None, None, None, None, None, None, vec![]).unwrap();
+        for (label, [journal, volume, pages, abstract_text, url], year, authors, expect) in cases {
+            let mut entry = Entry::new(
+                "article".to_string(),
+                "smith2024".to_string(),
+                "Fetched Title".to_string(),
+            );
+            entry.year = Some(2020);
+            entry.journal = s("Fetched Journal");
+            entry.volume = s("1");
+            entry.pages = s("1-2");
+            entry.abstract_text = s("Fetched abstract");
+            entry.url = s("https://fetched.example");
+            entry.add_author(Author::new(
+                "Fetched".to_string(),
+                Some("Author".to_string()),
+            ));
 
-        assert_eq!(entry.year, Some(2020));
-        assert_eq!(entry.journal, Some("Fetched Journal".to_string()));
-        assert_eq!(entry.authors.len(), 1);
-        assert_eq!(entry.authors[0].last_name, "Fetched");
-    }
-
-    // A malformed --author must fail loudly, same as the fully-manual path.
-    #[test]
-    fn apply_manual_overrides_rejects_an_unparsable_author() {
-        let mut entry = Entry::new(
-            "article".to_string(),
-            "smith2024".to_string(),
-            "Title".to_string(),
-        );
-        let result = apply_manual_overrides(
-            &mut entry,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            vec!["   ".to_string()],
-        );
-        assert!(result.is_err());
+            let result = apply_manual_overrides(
+                &mut entry,
+                year,
+                journal,
+                volume,
+                pages,
+                abstract_text,
+                url,
+                authors,
+            );
+            let Some(exp) = expect else {
+                assert!(result.is_err(), "{label}: should be rejected");
+                continue;
+            };
+            result.unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(entry.year, exp.year, "{label}: year");
+            assert_eq!(entry.journal.as_deref(), exp.journal, "{label}: journal");
+            assert_eq!(entry.volume.as_deref(), exp.volume, "{label}: volume");
+            assert_eq!(entry.pages.as_deref(), exp.pages, "{label}: pages");
+            assert_eq!(
+                entry.abstract_text.as_deref(),
+                exp.abstract_text,
+                "{label}: abstract"
+            );
+            assert_eq!(entry.url.as_deref(), exp.url, "{label}: url");
+            let got: Vec<(&str, Option<&str>)> = entry
+                .authors
+                .iter()
+                .map(|a| (a.last_name.as_str(), a.first_name.as_deref()))
+                .collect();
+            assert_eq!(got, exp.authors, "{label}: authors");
+        }
     }
 
     // The reuse rule: a name is only "already there" when the file at it
@@ -2816,7 +2834,10 @@ mod tests {
 
         let claimed = claim_free_name(&dir, "paper", "pdf").unwrap();
         assert_eq!(claimed, dir.join("paper-3.pdf"));
-        assert!(claimed.is_file(), "claim_free_name must leave a placeholder file behind");
+        assert!(
+            claimed.is_file(),
+            "claim_free_name must leave a placeholder file behind"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2845,11 +2866,7 @@ mod tests {
     fn prune_dangling_attachments_removes_only_the_row_whose_file_is_gone() {
         let (conn, dir) = test_db("prune");
 
-        let entry = Entry::new(
-            "article".to_string(),
-            "k".to_string(),
-            "T".to_string(),
-        );
+        let entry = Entry::new("article".to_string(), "k".to_string(), "T".to_string());
         db::insert_entry(&conn, &entry).unwrap();
 
         let real_path = dir.join("real.pdf");
@@ -2878,11 +2895,7 @@ mod tests {
     fn doctor_fix_detaches_only_broken_attachments() {
         let (conn, dir) = test_db("doctor-fix");
 
-        let entry = Entry::new(
-            "article".to_string(),
-            "k".to_string(),
-            "T".to_string(),
-        );
+        let entry = Entry::new("article".to_string(), "k".to_string(), "T".to_string());
         db::insert_entry(&conn, &entry).unwrap();
 
         let real_path = dir.join("real.pdf");
@@ -2913,85 +2926,109 @@ mod tests {
     }
 
     #[test]
-    fn find_snippets_truncates_with_ellipses_only_where_the_window_was_cut() {
-        // Long enough on both sides that a 5-byte context window is
-        // truncated by the fixed window, not by hitting the text's edge.
-        let text = "0123456789needle0123456789";
-        let (snippets, count) = find_snippets(text, "needle", 5, 3);
-        assert_eq!(count, 1);
-        assert_eq!(snippets, vec!["…56789needle01234…".to_string()]);
-    }
+    #[allow(clippy::type_complexity)] // a table of tuples
+    fn find_snippets_cases() {
+        // (label, text, query, context_bytes, max_matches, exact snippets if
+        // checked, expected snippet count, expected total count)
+        let cases: Vec<(
+            &str,
+            &str,
+            &str,
+            usize,
+            usize,
+            Option<&[&str]>,
+            usize,
+            usize,
+        )> = vec![
+            // Long enough on both sides that a 5-byte context window is
+            // truncated by the fixed window, not by hitting the text's edge.
+            (
+                "ellipses only where cut",
+                "0123456789needle0123456789",
+                "needle",
+                5,
+                3,
+                Some(&["…56789needle01234…"]),
+                1,
+                1,
+            ),
+            (
+                "no leading ellipsis at the very start",
+                "needle0123456789",
+                "needle",
+                5,
+                3,
+                Some(&["needle01234…"]),
+                1,
+                1,
+            ),
+            (
+                "no trailing ellipsis at the very end",
+                "0123456789needle",
+                "needle",
+                5,
+                3,
+                Some(&["…56789needle"]),
+                1,
+                1,
+            ),
+            // Every non-overlapping occurrence is counted; only max_matches
+            // snippets are actually built.
+            (
+                "caps snippets but counts every occurrence",
+                "needle needle needle needle needle",
+                "needle",
+                3,
+                2,
+                None,
+                2,
+                5,
+            ),
+            ("absent", "no match in here", "xyz", 10, 3, Some(&[]), 0, 0),
+            // 'é' (2-byte UTF-8) sits adjacent to the match on both sides,
+            // with no ASCII byte between it and "match". A 1-byte context
+            // window would, without boundary rounding, try to slice inside
+            // 'é' on both ends and panic; rounding must widen the window to
+            // include the whole character instead.
+            (
+                "rounds outward at a multibyte boundary",
+                "aématchéb",
+                "match",
+                1,
+                3,
+                Some(&["…ématché…"]),
+                1,
+                1,
+            ),
+            // B1 regression: SQL's FTS5 MATCH does full Unicode case
+            // folding, so a lowercase query must still find an
+            // uppercase-accented match.
+            (
+                "unicode case-insensitive",
+                "the drink was CAFÉ flavored",
+                "café",
+                3,
+                3,
+                Some(&["…as CAFÉ fl…"]),
+                1,
+                1,
+            ),
+        ];
+        for (label, text, query, ctx, max, exact, n_snippets, total) in cases {
+            let (snippets, count) = find_snippets(text, query, ctx, max);
+            assert_eq!(count, total, "{label}: count");
+            assert_eq!(snippets.len(), n_snippets, "{label}: snippet count");
+            if let Some(exact) = exact {
+                assert_eq!(snippets, exact, "{label}: snippets");
+            }
+        }
 
-    #[test]
-    fn find_snippets_no_leading_ellipsis_when_match_is_at_the_very_start() {
-        let text = "needle0123456789";
-        let (snippets, count) = find_snippets(text, "needle", 5, 3);
-        assert_eq!(count, 1);
-        assert_eq!(snippets, vec!["needle01234…".to_string()]);
-    }
-
-    #[test]
-    fn find_snippets_no_trailing_ellipsis_when_match_is_at_the_very_end() {
-        let text = "0123456789needle";
-        let (snippets, count) = find_snippets(text, "needle", 5, 3);
-        assert_eq!(count, 1);
-        assert_eq!(snippets, vec!["…56789needle".to_string()]);
-    }
-
-    #[test]
-    fn find_snippets_caps_returned_snippets_but_counts_every_occurrence() {
-        let text = "needle needle needle needle needle";
-        let (snippets, count) = find_snippets(text, "needle", 3, 2);
-        assert_eq!(count, 5, "every non-overlapping occurrence must be counted");
-        assert_eq!(
-            snippets.len(),
-            2,
-            "only max_matches snippets are actually built"
-        );
-    }
-
-    #[test]
-    fn find_snippets_returns_nothing_and_does_not_panic_when_absent() {
-        let (snippets, count) = find_snippets("no match in here", "xyz", 10, 3);
-        assert!(snippets.is_empty());
-        assert_eq!(count, 0);
-    }
-
-    // 'é' (2-byte UTF-8) sits adjacent to the match on both sides, with no
-    // ASCII byte between it and "match". A 1-byte context window would,
-    // without boundary rounding, try to slice inside 'é' on both ends and
-    // panic; rounding must widen the window to include the whole character
-    // instead.
-    #[test]
-    fn find_snippets_rounds_the_window_outward_at_a_multibyte_boundary() {
-        let text = "aématchéb";
-        let (snippets, count) = find_snippets(text, "match", 1, 3);
-        assert_eq!(count, 1);
-        assert_eq!(snippets, vec!["…ématché…".to_string()]);
-    }
-
-    // B1 regression: SQL's FTS5 MATCH does full Unicode case folding, so a
-    // lowercase query must still find an uppercase-accented match -- an
-    // ASCII-only lowercase pass (the old implementation) misses this.
-    #[test]
-    fn find_snippets_matches_unicode_case_insensitively() {
-        let text = "the drink was CAFÉ flavored";
-        let (snippets, count) = find_snippets(text, "café", 3, 3);
-        assert_eq!(count, 1, "lowercase query must find the uppercase match");
-        assert_eq!(snippets, vec!["…as CAFÉ fl…".to_string()]);
-    }
-
-    // Edge case: a character whose lowercase form has a different length
-    // than its uppercase form (Turkish İ lowercases to "i̇", two chars) must
-    // not panic -- exact snippet/count behavior isn't guaranteed correct
-    // here, just that it doesn't blow up.
-    #[test]
-    fn find_snippets_does_not_panic_on_a_length_changing_case_fold() {
-        let text = "İstanbul is a city, as is ISTANBUL";
-        let (_snippets, _count) = find_snippets(text, "istanbul", 5, 3);
-
-        let text2 = "ß appears here, and SS appears there too";
-        let (_snippets2, _count2) = find_snippets(text2, "ss", 5, 3);
+        // A character whose lowercase form has a different length than its
+        // uppercase form (Turkish İ lowercases to "i̇", two chars) must not
+        // panic -- exact snippet/count behavior isn't guaranteed correct
+        // here, just that it doesn't blow up.
+        find_snippets("İstanbul is a city, as is ISTANBUL", "istanbul", 5, 3);
+        find_snippets("ß appears here, and SS appears there too", "ss", 5, 3);
     }
 
     // try_candidates drives fetch_pdf_for_entry's candidate loop; these
@@ -3019,184 +3056,263 @@ mod tests {
         Instant::now() + Duration::from_secs(1000)
     }
 
+    // Each row runs `try_candidates` with a fake `download` (which records
+    // the URLs it is asked for) and checks the outcome.
     #[test]
-    fn try_candidates_stops_at_the_first_success() {
-        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
-        let mut calls: Vec<String> = Vec::new();
-        let outcome = try_candidates(sources, far_future(), |url| {
-            calls.push(url.to_string());
-            if url == "a1" {
-                DownloadOutcome::Landed(42)
-            } else {
-                panic!("B should never be tried once A succeeds")
+    fn try_candidates_cases() {
+        enum Att {
+            Exact(&'static str),
+            Has(&'static [&'static str]),
+        }
+        struct Case {
+            label: &'static str,
+            sources: Vec<CandidateSource>,
+            deadline: fn() -> Instant,
+            download: fn(&str) -> DownloadOutcome<i32>,
+            calls: Option<&'static [&'static str]>,
+            // Some(msg): the whole call must fail with exactly this error.
+            err: Option<&'static str>,
+            landed: Option<(i32, &'static str)>,
+            attempted: Vec<Att>,
+            any_download: bool,
+            any_resolver_error: bool,
+        }
+        let ok_case = |label,
+                       sources,
+                       deadline,
+                       download,
+                       landed,
+                       attempted,
+                       any_download,
+                       any_resolver_error| Case {
+            label,
+            sources,
+            deadline,
+            download,
+            calls: None,
+            err: None,
+            landed,
+            attempted,
+            any_download,
+            any_resolver_error,
+        };
+        let never: fn(&str) -> DownloadOutcome<i32> =
+            |_| panic!("no URL was ever produced, download must not be called");
+        let retry: fn(&str) -> DownloadOutcome<i32> =
+            |_| DownloadOutcome::Retry("nope".to_string());
+
+        let cases = vec![
+            Case {
+                calls: Some(&["a1"]),
+                ..ok_case(
+                    "stops at the first success",
+                    vec![src("A", &["a1"]), src("B", &["b1"])],
+                    far_future,
+                    |url| {
+                        if url == "a1" {
+                            DownloadOutcome::Landed(42)
+                        } else {
+                            panic!("B should never be tried once A succeeds")
+                        }
+                    },
+                    Some((42, "A")),
+                    vec![],
+                    true,
+                    false,
+                )
+            },
+            ok_case(
+                "moves on after a failed download",
+                vec![src("A", &["a1"]), src("B", &["b1"])],
+                far_future,
+                |url| {
+                    if url == "a1" {
+                        DownloadOutcome::Retry("boom".to_string())
+                    } else {
+                        DownloadOutcome::Landed(7)
+                    }
+                },
+                Some((7, "B")),
+                vec![Att::Has(&["A", "boom"])],
+                true,
+                false,
+            ),
+            Case {
+                calls: Some(&["a1", "a2"]),
+                ..ok_case(
+                    "tries every url of a source before moving on",
+                    vec![src("A", &["a1", "a2"]), src("B", &["b1"])],
+                    far_future,
+                    |url| {
+                        if url == "a2" {
+                            DownloadOutcome::Landed(1)
+                        } else {
+                            DownloadOutcome::Retry("no".to_string())
+                        }
+                    },
+                    Some((1, "A")),
+                    vec![Att::Has(&["A"])],
+                    true,
+                    false,
+                )
+            },
+            // Every source empty: nothing was ever attempted, no resolver
+            // errored -- a clean "no PDF anywhere".
+            ok_case(
+                "all sources empty",
+                vec![src("A", &[]), src("B", &[])],
+                far_future,
+                |_| DownloadOutcome::Landed(0),
+                None,
+                vec![Att::Exact("A"), Att::Exact("B")],
+                false,
+                false,
+            ),
+            // Candidates existed, but every download failed.
+            ok_case(
+                "all downloads failed",
+                vec![src("A", &["a1"]), src("B", &["b1"])],
+                far_future,
+                retry,
+                None,
+                vec![Att::Has(&[]), Att::Has(&[])],
+                true,
+                false,
+            ),
+            // L4: a source that plainly doesn't apply (PMC with no pmcid,
+            // here stood in for by `not_applicable_src`) was never actually
+            // consulted, so it must not appear in `attempted` at all --
+            // unlike a source that was consulted and genuinely had nothing
+            // (`src("B", &[])`), which still does.
+            ok_case(
+                "omits sources that were never applicable",
+                vec![not_applicable_src("PMC"), src("B", &[])],
+                far_future,
+                never,
+                None,
+                vec![Att::Exact("B")],
+                false,
+                false,
+            ),
+            // A resolver erroring (the PMC listing, the bioRxiv API,
+            // Unpaywall itself) must not read the same as that source
+            // cleanly having nothing: any_resolver_error is how the caller
+            // tells "a source actually failed" from "no OA copy exists".
+            ok_case(
+                "resolver error vs clean empty source",
+                vec![failing_src("A", "network unreachable"), src("B", &[])],
+                far_future,
+                never,
+                None,
+                vec![Att::Has(&["A", "network unreachable"]), Att::Has(&[])],
+                false,
+                true,
+            ),
+            // A later source succeeding still wins, despite the earlier error.
+            ok_case(
+                "later source wins despite an earlier resolver error",
+                vec![failing_src("A", "boom"), src("B", &["b1"])],
+                far_future,
+                |_| DownloadOutcome::Landed(9),
+                Some((9, "B")),
+                vec![Att::Has(&["A", "boom"])],
+                true,
+                true,
+            ),
+            // A Fatal outcome (a systemic failure landing the bytes, not a
+            // per-candidate download problem) aborts the whole loop
+            // immediately as an Err; B never gets tried.
+            Case {
+                calls: Some(&["a1"]),
+                err: Some("disk full"),
+                ..ok_case(
+                    "fatal aborts immediately",
+                    vec![src("A", &["a1"]), src("B", &["b1"])],
+                    far_future,
+                    |_| DownloadOutcome::Fatal("disk full".to_string()),
+                    None,
+                    vec![],
+                    false,
+                    false,
+                )
+            },
+            // T3: an already-passed deadline stops the loop before trying
+            // anything -- and the stop itself is recorded in `attempted`.
+            ok_case(
+                "already-passed deadline",
+                vec![src("A", &["a1"]), src("B", &["b1"])],
+                || Instant::now() - Duration::from_secs(1),
+                |_| panic!("the deadline already passed; nothing should be tried"),
+                None,
+                vec![Att::Exact("stopped: 60s time limit reached")],
+                false,
+                false,
+            ),
+            // The deadline is also checked between URLs within one source:
+            // a1 is tried (and fails slowly); a2 never is.
+            ok_case(
+                "deadline passes mid-source",
+                vec![src("A", &["a1", "a2"])],
+                || Instant::now() + Duration::from_millis(20),
+                |_| {
+                    std::thread::sleep(Duration::from_millis(40));
+                    DownloadOutcome::Retry("slow".to_string())
+                },
+                None,
+                vec![Att::Has(&[]), Att::Has(&["time limit"])],
+                true,
+                false,
+            ),
+        ];
+
+        for c in cases {
+            let mut calls: Vec<String> = Vec::new();
+            let download = c.download;
+            let result = try_candidates(c.sources, (c.deadline)(), |url| {
+                calls.push(url.to_string());
+                download(url)
+            });
+            if let Some(calls_exp) = c.calls {
+                assert_eq!(calls, calls_exp, "{}: calls", c.label);
             }
-        })
-        .unwrap();
-        assert_eq!(calls, vec!["a1".to_string()]);
-        assert_eq!(outcome.landed, Some((42, "A")));
-        assert!(outcome.attempted.is_empty());
-        assert!(outcome.any_download_attempted);
-        assert!(!outcome.any_resolver_error);
-    }
-
-    #[test]
-    fn try_candidates_moves_on_after_a_failed_download() {
-        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
-        let outcome = try_candidates(sources, far_future(), |url: &str| -> DownloadOutcome<i32> {
-            if url == "a1" {
-                DownloadOutcome::Retry("boom".to_string())
-            } else {
-                DownloadOutcome::Landed(7)
+            if let Some(msg) = c.err {
+                assert!(
+                    matches!(&result, Err(e) if e == msg),
+                    "{}: expected Err({msg})",
+                    c.label
+                );
+                continue;
             }
-        })
-        .unwrap();
-        assert_eq!(outcome.landed, Some((7, "B")));
-        assert_eq!(outcome.attempted.len(), 1);
-        assert!(outcome.attempted[0].contains('A'));
-        assert!(outcome.attempted[0].contains("boom"));
-        assert!(outcome.any_download_attempted);
-        assert!(!outcome.any_resolver_error);
-    }
-
-    #[test]
-    fn try_candidates_tries_every_url_of_a_source_before_moving_on() {
-        let sources = vec![src("A", &["a1", "a2"]), src("B", &["b1"])];
-        let mut calls: Vec<String> = Vec::new();
-        let outcome = try_candidates(sources, far_future(), |url| {
-            calls.push(url.to_string());
-            if url == "a2" {
-                DownloadOutcome::Landed(1)
-            } else {
-                DownloadOutcome::Retry("no".to_string())
+            let outcome = result.unwrap_or_else(|e| panic!("{}: {e}", c.label));
+            assert_eq!(outcome.landed, c.landed, "{}: landed", c.label);
+            assert_eq!(
+                outcome.attempted.len(),
+                c.attempted.len(),
+                "{}: attempted {:?}",
+                c.label,
+                outcome.attempted
+            );
+            for (got, want) in outcome.attempted.iter().zip(&c.attempted) {
+                match want {
+                    Att::Exact(w) => assert_eq!(got, w, "{}: attempted", c.label),
+                    Att::Has(frags) => {
+                        for f in *frags {
+                            assert!(got.contains(f), "{}: {got:?} should contain {f:?}", c.label);
+                        }
+                    }
+                }
             }
-        })
-        .unwrap();
-        assert_eq!(calls, vec!["a1".to_string(), "a2".to_string()]);
-        assert_eq!(outcome.landed.map(|(_, s)| s), Some("A"));
-    }
-
-    #[test]
-    fn try_candidates_all_failed_is_distinguishable_from_nothing_to_try() {
-        // Every source empty: nothing was ever attempted, no resolver
-        // errored -- a clean "no PDF anywhere".
-        let empty_sources = vec![src("A", &[]), src("B", &[])];
-        let outcome = try_candidates(empty_sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
-            DownloadOutcome::Landed(0)
-        })
-        .unwrap();
-        assert!(outcome.landed.is_none());
-        assert_eq!(outcome.attempted, vec!["A".to_string(), "B".to_string()]);
-        assert!(!outcome.any_download_attempted);
-        assert!(!outcome.any_resolver_error);
-
-        // Candidates existed, but every download failed.
-        let real_sources = vec![src("A", &["a1"]), src("B", &["b1"])];
-        let outcome = try_candidates(real_sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
-            DownloadOutcome::Retry("nope".to_string())
-        })
-        .unwrap();
-        assert!(outcome.landed.is_none());
-        assert_eq!(outcome.attempted.len(), 2);
-        assert!(outcome.any_download_attempted);
-        assert!(!outcome.any_resolver_error);
-    }
-
-    // L4: a source that plainly doesn't apply (PMC with no pmcid, here
-    // stood in for by `not_applicable_src`) was never actually consulted,
-    // so it must not appear in `attempted` at all -- unlike a source that
-    // was consulted and genuinely had nothing (`src("B", &[])`), which
-    // still does.
-    #[test]
-    fn try_candidates_omits_sources_that_were_never_applicable() {
-        let sources = vec![not_applicable_src("PMC"), src("B", &[])];
-        let outcome = try_candidates(sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
-            panic!("no URL was ever produced, download must not be called")
-        })
-        .unwrap();
-        assert!(outcome.landed.is_none());
-        assert_eq!(outcome.attempted, vec!["B".to_string()]);
-    }
-
-    // A resolver erroring (the PMC listing, the bioRxiv API, Unpaywall
-    // itself) must not read the same as that source cleanly having nothing:
-    // if nothing else pans out either, the caller has to be able to tell
-    // "a source actually failed" from "no OA copy exists", which is what
-    // any_resolver_error is for.
-    #[test]
-    fn try_candidates_a_resolver_error_is_distinguishable_from_a_clean_empty_source() {
-        let sources = vec![failing_src("A", "network unreachable"), src("B", &[])];
-        let outcome = try_candidates(sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
-            panic!("no URL was ever produced, download must not be called")
-        })
-        .unwrap();
-        assert!(outcome.landed.is_none());
-        assert!(!outcome.any_download_attempted);
-        assert!(outcome.any_resolver_error);
-        assert_eq!(outcome.attempted.len(), 2);
-        assert!(outcome.attempted[0].contains('A'));
-        assert!(outcome.attempted[0].contains("network unreachable"));
-
-        // A later source succeeding still wins, despite the earlier error.
-        let sources = vec![failing_src("A", "boom"), src("B", &["b1"])];
-        let outcome = try_candidates(sources, far_future(), |_: &str| -> DownloadOutcome<i32> {
-            DownloadOutcome::Landed(9)
-        })
-        .unwrap();
-        assert_eq!(outcome.landed, Some((9, "B")));
-        assert!(outcome.any_resolver_error);
-    }
-
-    // A Fatal outcome (a systemic failure landing the bytes, not a
-    // per-candidate download problem) aborts the whole loop immediately as
-    // an Err, rather than being recorded as "this candidate failed, try the
-    // next" the way Retry is.
-    #[test]
-    fn try_candidates_a_fatal_outcome_aborts_immediately() {
-        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
-        let mut calls: Vec<String> = Vec::new();
-        let result = try_candidates(sources, far_future(), |url| {
-            calls.push(url.to_string());
-            DownloadOutcome::Fatal::<i32>("disk full".to_string())
-        });
-        assert!(matches!(result, Err(e) if e == "disk full"));
-        // B never gets tried: a fatal error is not "move on to the next
-        // candidate".
-        assert_eq!(calls, vec!["a1".to_string()]);
-    }
-
-    // T3: an already-passed deadline stops the loop before trying anything
-    // else -- neither a later source's resolver nor a later URL within the
-    // same source gets a chance, and the stop itself is recorded so it's
-    // visible in the output, not silently indistinguishable from "no PDF
-    // anywhere".
-    #[test]
-    fn try_candidates_stops_at_an_already_passed_deadline() {
-        let past = Instant::now() - Duration::from_secs(1);
-        let sources = vec![src("A", &["a1"]), src("B", &["b1"])];
-        let outcome = try_candidates(sources, past, |_: &str| -> DownloadOutcome<i32> {
-            panic!("the deadline already passed; nothing should be tried")
-        })
-        .unwrap();
-        assert!(outcome.landed.is_none());
-        assert_eq!(outcome.attempted, vec!["stopped: 60s time limit reached".to_string()]);
-    }
-
-    // The deadline is also checked between URLs within one source, not
-    // just between sources.
-    #[test]
-    fn try_candidates_stops_mid_source_once_the_deadline_passes() {
-        let sources = vec![src("A", &["a1", "a2"])];
-        let deadline = Instant::now() + Duration::from_millis(20);
-        let outcome = try_candidates(sources, deadline, |_: &str| -> DownloadOutcome<i32> {
-            std::thread::sleep(Duration::from_millis(40));
-            DownloadOutcome::Retry("slow".to_string())
-        })
-        .unwrap();
-        assert!(outcome.landed.is_none());
-        // a1 was tried (and failed slowly); a2 never was, because by then
-        // the deadline had passed.
-        assert_eq!(outcome.attempted.len(), 2);
-        assert!(outcome.attempted[1].contains("time limit"));
+            assert_eq!(
+                outcome.any_download_attempted, c.any_download,
+                "{}: any_download_attempted",
+                c.label
+            );
+            assert_eq!(
+                outcome.any_resolver_error, c.any_resolver_error,
+                "{}: any_resolver_error",
+                c.label
+            );
+        }
     }
 
     #[test]
@@ -3211,9 +3327,10 @@ mod tests {
         });
         assert!(matches!(fatal, DownloadOutcome::Fatal(e) if e == "disk full"));
 
-        let landed = classify_download(Ok(vec![1, 2, 3]), |bytes: &[u8]| -> Result<usize, String> {
-            Ok(bytes.len())
-        });
+        let landed =
+            classify_download(Ok(vec![1, 2, 3]), |bytes: &[u8]| -> Result<usize, String> {
+                Ok(bytes.len())
+            });
         assert!(matches!(landed, DownloadOutcome::Landed(3)));
     }
 
@@ -3235,7 +3352,14 @@ mod tests {
         let names: Vec<&str> = sources.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
-            vec!["PMC", "Unpaywall", "arXiv", "bioRxiv", "OSF", "preprints.org"]
+            vec![
+                "PMC",
+                "Unpaywall",
+                "arXiv",
+                "bioRxiv",
+                "OSF",
+                "preprints.org"
+            ]
         );
         // Every resolver here is safe to actually run without a network
         // call, given the inputs above. Unpaywall is always "consulted"
@@ -3253,7 +3377,10 @@ mod tests {
 
     #[test]
     fn url_host_extracts_just_the_host() {
-        assert_eq!(url_host("https://journals.aps.org/pdf/x?y=1"), "journals.aps.org");
+        assert_eq!(
+            url_host("https://journals.aps.org/pdf/x?y=1"),
+            "journals.aps.org"
+        );
         assert_eq!(url_host("http://example.org/a/b#frag"), "example.org");
         assert_eq!(url_host("not-a-url"), "not-a-url");
     }
@@ -3277,11 +3404,12 @@ mod tests {
 
     #[test]
     fn summarize_fetch_error_counts_attempts_and_bot_blocks() {
-        let e = "no open-access PDF could be downloaded for 'k' (DOI 10.1/x): \
-                  PMC (host1): not found (404); \
-                  Unpaywall (host2): blocked by a bot check (HTTP 403); \
-                  download a blocked one in a browser and use `ferref attach` instead";
-        let summary = summarize_fetch_error("k", e);
+        let e = format!(
+            "no open-access PDF could be downloaded for 'k' (DOI 10.1/x): \
+             PMC (host1): not found (404); \
+             Unpaywall (host2): blocked by a bot check (HTTP 403){BLOCKED_ADVICE}"
+        );
+        let summary = summarize_fetch_error("k", &e);
         assert!(summary.contains("2 copies tried"));
         assert!(summary.contains("1 blocked by bot checks"));
         assert!(summary.contains("ferref fetch k"));

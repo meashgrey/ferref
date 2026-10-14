@@ -159,10 +159,8 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
             if app.filter.is_empty() && app.marked.is_empty() {
                 app.should_quit = true;
             } else {
-                app.filter.clear();
                 app.marked.clear();
-                app.rebuild_view();
-                app.details_scroll = 0;
+                app.set_filter(String::new());
             }
         }
         KeyCode::Tab => app.focus = app.focus.next(),
@@ -320,7 +318,7 @@ fn handle_normal_key(app: &mut App, conn: &Connection, code: KeyCode, modifiers:
         // tabbing to Collections to file a marked set and changing your
         // mind before pressing "c".
         KeyCode::Char('U') => app.marked.clear(),
-        // The ":" command palette (Edit/Fetch/Merge/Delete), scoped to
+        // The ":" command palette, scoped to
         // whichever entry is currently selected.
         KeyCode::Char(':')
             if matches!(app.focus, Focus::Entries | Focus::Details) && !app.view.is_empty() =>
@@ -348,18 +346,14 @@ fn handle_input_key(
         KeyCode::Char(c) => {
             buffer.push(c);
             if matches!(kind, InputKind::Search { .. }) {
-                app.filter = buffer.clone();
-                app.rebuild_view();
-                app.details_scroll = 0;
+                app.set_filter(buffer.clone());
             }
             app.mode = Mode::Input(kind, buffer);
         }
         KeyCode::Backspace => {
             buffer.pop();
             if matches!(kind, InputKind::Search { .. }) {
-                app.filter = buffer.clone();
-                app.rebuild_view();
-                app.details_scroll = 0;
+                app.set_filter(buffer.clone());
             }
             app.mode = Mode::Input(kind, buffer);
         }
@@ -408,9 +402,7 @@ fn handle_input_key(
         KeyCode::Esc => {
             match kind {
                 InputKind::Search { previous } => {
-                    app.filter = previous;
-                    app.rebuild_view();
-                    app.details_scroll = 0;
+                    app.set_filter(previous);
                     app.mode = Mode::Normal;
                 }
                 InputKind::NewCollection
@@ -461,9 +453,7 @@ fn handle_picker_key(
         }
         KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
-            if selected + 1 < rows.len() {
-                selected += 1;
-            }
+            selected = (selected + 1).min(rows.len().saturating_sub(1));
         }
         KeyCode::Enter => {
             let (_, collection_id, collection_name) = rows[selected].clone();
@@ -614,11 +604,7 @@ fn handle_entry_picker_key(
             return; // app.mode is already Normal
         }
         KeyCode::Up => selected = selected.saturating_sub(1),
-        KeyCode::Down => {
-            if selected + 1 < rows.len() {
-                selected += 1;
-            }
-        }
+        KeyCode::Down => selected = (selected + 1).min(rows.len().saturating_sub(1)),
         KeyCode::Backspace => {
             filter.pop();
             rows = entry_picker_rows(&candidates, keep_id, &filter);
@@ -850,8 +836,8 @@ impl SortKey {
     }
 }
 
-// Normal mode is the only one where a keystroke is a command; the other two
-// modes eat every printable character into a buffer (see the module-level
+// Normal mode is the only one where a keystroke is a command; the text-entry
+// modes (Input, EntryPicker) eat every printable character into a buffer (see the module-level
 // "TRAP" note in DESIGN.md's Phase 12 section -- typing "query" must not
 // also quit at 'q' or reload at 'r').
 enum Mode {
@@ -871,7 +857,7 @@ enum Mode {
         // session has actually filed the set into it.
         bulk: Option<Vec<i64>>,
     },
-    // The ":" palette (Edit/Fetch/Merge/Delete), scoped to one entry.
+    // The ":" palette, scoped to one entry.
     Command {
         entry_id: i64,
     },
@@ -898,7 +884,7 @@ enum Mode {
         selected: usize,
     },
     // Delete/merge confirmation. An enum of pending actions (rather than a
-    // boxed closure) since there are exactly two call sites.
+    // boxed closure) since the set of actions is small and fixed.
     Confirm {
         message: String,
         action: PendingAction,
@@ -930,8 +916,8 @@ struct BrowserEntry {
 // `file_type()` is skipped rather than failing the whole listing, since one
 // bad entry in a directory shouldn't hide every other entry.
 fn list_dir(dir: &Path) -> Result<Vec<BrowserEntry>, String> {
-    let read = std::fs::read_dir(dir)
-        .map_err(|e| format!("failed to read '{}': {e}", dir.display()))?;
+    let read =
+        std::fs::read_dir(dir).map_err(|e| format!("failed to read '{}': {e}", dir.display()))?;
 
     let mut entries: Vec<BrowserEntry> = Vec::new();
     for item in read.flatten() {
@@ -1015,16 +1001,13 @@ enum PendingAction {
     // "D" in the Collections pane. `parent_id` is captured at confirm time
     // (see App::begin_delete_collection), not re-derived afterward -- once
     // the collection is deleted there's nothing left to ask its parent id.
-    DeleteCollection {
-        id: i64,
-        parent_id: Option<i64>,
-    },
+    DeleteCollection { id: i64, parent_id: Option<i64> },
 }
 
 // Field names Edit (":" -> "e") can change: Entry's own scalar columns plus
 // authors (whole-list replace, the same semantics `ferref edit --author`
 // already has). Tags aren't here -- they're not an `entries` column, and
-// DESIGN.md's Phase 16 section lists tagging from the TUI as out of scope.
+// they have their own ":" -> "t"/"u" actions.
 #[derive(Clone, Copy, PartialEq)]
 enum EditField {
     Title,
@@ -1088,9 +1071,7 @@ impl EditField {
         let trimmed = raw.trim();
         match self {
             EditField::Title => {
-                if trimmed.is_empty() {
-                    return Err("title cannot be empty".to_string());
-                }
+                crate::cli::validate_title(trimmed)?;
                 entry.title = trimmed.to_string();
             }
             EditField::Year => {
@@ -1221,7 +1202,7 @@ struct App {
     // not here, since the true max depends on the pane's rendered width
     // (line-wrapping), which this field's own writers don't have.
     details_scroll: u16,
-    // entry id -> [(attachment path, extracted-text char length)], loaded
+    // entry id -> extracted-text char length per attachment (see AttachmentLengths), loaded
     // alongside `entries` so the details pane never queries during render.
     attachment_lengths: AttachmentLengths,
 
@@ -1285,31 +1266,30 @@ impl App {
     // collection no longer exists, falls back to "All Papers" rather than
     // erroring.
     fn reload(&mut self, conn: &Connection) -> Result<(), String> {
-        let selected_id = self.rows[self.selected_row].id;
-        self.rows = load_tree(conn)?;
-        self.selected_row = self
-            .rows
-            .iter()
-            .position(|r| r.id == selected_id)
-            .unwrap_or(0);
+        self.reload_tree_counts(conn)?;
+        self.load_selected_entries(conn)
+    }
 
-        // A reload can reparent the selected collection under a node that is
-        // currently collapsed. Snap to a visible ancestor before fetching, so
-        // the entry table matches the row actually highlighted.
-        self.ensure_selected_visible();
-
-        let collection_id = self.rows[self.selected_row].id;
-        let (entries, lengths) = load_entries(conn, collection_id)?;
+    // Loads the selected collection's entries and rebuilds the view.
+    // `table_selected` is a position, not an entry id -- a reload can change
+    // what actually occupies that position (an edit made from another
+    // session, an entry deleted elsewhere), so a stale Details scroll must
+    // not carry over onto whatever's there now. Same reasoning as the
+    // "s"/"S" sort handlers.
+    fn load_selected_entries(&mut self, conn: &Connection) -> Result<(), String> {
+        let (entries, lengths) = load_entries(conn, self.rows[self.selected_row].id)?;
         self.entries = entries;
         self.attachment_lengths = lengths;
         self.rebuild_view();
-        // `table_selected` is a position, not an entry id -- a reload can
-        // change what actually occupies that position (an edit made from
-        // another session, an entry deleted elsewhere), so a stale Details
-        // scroll must not carry over onto whatever's there now. Same
-        // reasoning as the "s"/"S" sort handlers.
         self.details_scroll = 0;
         Ok(())
+    }
+
+    // Replaces the search filter and refreshes the view.
+    fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.rebuild_view();
+        self.details_scroll = 0;
     }
 
     // Re-reads just the tree (rows + entry_count), keeping the current
@@ -1375,7 +1355,7 @@ impl App {
                     self.status = Some(e);
                 }
             }
-            // db_error, not e.to_string(): a rejected name arrives as
+            // friendly, not e.to_string(): a rejected name arrives as
             // InvalidParameterName wrapping a message already written for a
             // human, and to_string() prefixes it with "Invalid parameter
             // name:" -- rusqlite's vocabulary leaking onto the footer.
@@ -1392,12 +1372,13 @@ impl App {
     // collection's parent_id, which is NULL in the DB) and for "All
     // Papers" itself.
     fn parent_row_id(&self, row_idx: usize) -> Option<i64> {
-        let depth = self.rows[row_idx].depth;
-        self.rows[..row_idx]
-            .iter()
-            .rev()
-            .find(|r| r.depth + 1 == depth)
-            .and_then(|r| r.id)
+        self.parent_row(row_idx).and_then(|i| self.rows[i].id)
+    }
+
+    // Index of the nearest preceding row one depth shallower, if any.
+    fn parent_row(&self, idx: usize) -> Option<usize> {
+        let depth = self.rows[idx].depth.checked_sub(1)?;
+        (0..idx).rev().find(|&i| self.rows[i].depth == depth)
     }
 
     // How many rows below `row_idx` belong to its subtree: the contiguous
@@ -1487,20 +1468,17 @@ impl App {
             }
         };
         self.selected_row = match parent_id {
-            Some(pid) => self.rows.iter().position(|r| r.id == Some(pid)).unwrap_or(0),
+            Some(pid) => self
+                .rows
+                .iter()
+                .position(|r| r.id == Some(pid))
+                .unwrap_or(0),
             None => self.selected_row.min(self.rows.len() - 1),
         };
         self.ensure_selected_visible();
 
-        let collection_id = self.rows[self.selected_row].id;
-        match load_entries(conn, collection_id) {
-            Ok((entries, lengths)) => {
-                self.entries = entries;
-                self.attachment_lengths = lengths;
-                self.rebuild_view();
-                self.details_scroll = 0;
-            }
-            Err(e) => self.status = Some(e),
+        if let Err(e) = self.load_selected_entries(conn) {
+            self.status = Some(e);
         }
     }
 
@@ -1698,7 +1676,11 @@ impl App {
         // picked a valid row, but that row is a different entry, so the
         // stale scroll position from the old entry's Details pane no longer
         // means anything.
-        match self.view.iter().position(|&i| self.entries[i].id == Some(entry_id)) {
+        match self
+            .view
+            .iter()
+            .position(|&i| self.entries[i].id == Some(entry_id))
+        {
             Some(row) => self.table_selected = row,
             None => self.details_scroll = 0,
         }
@@ -1747,10 +1729,7 @@ impl App {
         // a direct DB lookup instead of being silently dropped.
         let selected: Vec<Entry> = ids
             .iter()
-            .filter_map(|&id| match self.entry_by_id(id).cloned() {
-                Some(e) => Some(e),
-                None => db::get_entry_by_id(conn, id).ok().flatten(),
-            })
+            .filter_map(|&id| self.resolve_entry(conn, id))
             .collect();
         let bibtex_str = crate::bibtex::export(&selected, false);
         match std::fs::write(path, &bibtex_str) {
@@ -1795,7 +1774,7 @@ impl App {
             match result {
                 Ok(did_change) => changed += did_change as usize,
                 Err(e) => {
-                    // crate::entry_error, not e.to_string(): add_tag/remove_tag
+                    // crate::friendly, not e.to_string(): add_tag/remove_tag
                     // report an unknown cite_key as QueryReturnedNoRows, which
                     // would otherwise reach the footer as the bare SQLite
                     // message "Query returned no rows" instead of naming the
@@ -1827,7 +1806,7 @@ impl App {
     }
 
     // Fetch (":" -> "f"): the Unpaywall round-trip and PDF download block
-    // the event loop, so a "Fetching…" footer is drawn (reusing `error`'s
+    // the event loop, so a "Fetching…" footer is drawn (reusing `status`'s
     // slot, the one line already rendered every frame) *before* the
     // blocking call, or the freeze reads as a hang rather than progress.
     // No --email equivalent in the TUI: falls back to FERREF_EMAIL / the
@@ -1884,7 +1863,7 @@ impl App {
     // a cancelled merge (Esc out of the picker, 'n' at the confirm prompt)
     // can't leave a foreign-collection entry sitting there for the next
     // `rebuild_view` to show in the wrong collection's list.
-    fn resolve_merge_entry(&self, conn: &Connection, id: i64) -> Option<Entry> {
+    fn resolve_entry(&self, conn: &Connection, id: i64) -> Option<Entry> {
         self.entry_by_id(id)
             .cloned()
             .or_else(|| db::get_entry_by_id(conn, id).ok().flatten())
@@ -1909,10 +1888,10 @@ impl App {
             Some(MergePlan::PickDropWithin(keep_id, marked_ids)) => {
                 // Candidates are resolved once, here, into owned Entry
                 // values the picker carries itself -- never appended to
-                // `self.entries` (see resolve_merge_entry).
+                // `self.entries` (see resolve_entry).
                 let candidates: Vec<Entry> = marked_ids
                     .iter()
-                    .filter_map(|&id| self.resolve_merge_entry(conn, id))
+                    .filter_map(|&id| self.resolve_entry(conn, id))
                     .collect();
                 let rows = entry_picker_rows(&candidates, keep_id, "");
                 self.mode = Mode::EntryPicker {
@@ -1935,7 +1914,7 @@ impl App {
         // once, here, into the message string itself -- nothing is kept
         // around afterward for a cancelled confirm to leak.
         let title_of = |id: i64| {
-            self.resolve_merge_entry(conn, id)
+            self.resolve_entry(conn, id)
                 .map(|e| truncate_display(&e.title, 20))
                 .unwrap_or_default()
         };
@@ -1972,7 +1951,8 @@ impl App {
             .map(PathBuf::from)
             .or_else(|| std::env::current_dir().ok());
         let Some(start) = start else {
-            self.status = Some("cannot determine a starting directory: $HOME is not set".to_string());
+            self.status =
+                Some("cannot determine a starting directory: $HOME is not set".to_string());
             return;
         };
         match list_dir(&start) {
@@ -1999,18 +1979,12 @@ impl App {
             return;
         }
         let mut idx = self.selected_row;
-        while self.rows[idx].depth > 0 {
-            let target_depth = self.rows[idx].depth - 1;
-            match (0..idx).rev().find(|&i| self.rows[i].depth == target_depth) {
-                Some(parent) => {
-                    if visible.contains(&parent) {
-                        self.selected_row = parent;
-                        return;
-                    }
-                    idx = parent;
-                }
-                None => break,
+        while let Some(parent) = self.parent_row(idx) {
+            if visible.contains(&parent) {
+                self.selected_row = parent;
+                return;
             }
+            idx = parent;
         }
         self.selected_row = 0;
     }
@@ -2036,15 +2010,8 @@ impl App {
     // different collection's entries with nothing to say so.
     fn select_row(&mut self, conn: &Connection, row_idx: usize) {
         self.selected_row = row_idx;
-        let collection_id = self.rows[row_idx].id;
-        match load_entries(conn, collection_id) {
-            Ok((entries, lengths)) => {
-                self.entries = entries;
-                self.attachment_lengths = lengths;
-                self.table_selected = 0;
-                self.details_scroll = 0;
-                self.rebuild_view();
-            }
+        match self.load_selected_entries(conn) {
+            Ok(()) => self.table_selected = 0,
             Err(e) => self.status = Some(e),
         }
     }
@@ -2086,11 +2053,8 @@ impl App {
             self.collapsed.insert(id);
             return;
         }
-        if self.rows[row].depth > 0 {
-            let target_depth = self.rows[row].depth - 1;
-            if let Some(parent) = (0..row).rev().find(|&i| self.rows[i].depth == target_depth) {
-                self.select_row(conn, parent);
-            }
+        if let Some(parent) = self.parent_row(row) {
+            self.select_row(conn, parent);
         }
     }
 
@@ -2180,13 +2144,10 @@ fn load_entries(
     // named with a literal "/" (hand-written into SQLite) produces a path that
     // can't be parsed back, and filtering by it silently returned nothing
     // while the tree pane went on showing a non-zero count beside it.
-    let filter = match collection_id {
-        None => Filter::default(),
-        Some(id) => Filter {
-            collection_id: Some(id),
-            recursive: true,
-            ..Default::default()
-        },
+    let filter = Filter {
+        collection_id,
+        recursive: true,
+        ..Default::default()
     };
     let entries = db::list_entries(conn, &filter, false).map_err(|e| e.to_string())?;
     let lengths = db::all_attachment_text_lengths(conn).map_err(|e| e.to_string())?;
@@ -2227,16 +2188,16 @@ fn clamp_selection(selected: usize, len: usize) -> usize {
     if len == 0 { 0 } else { selected.min(len - 1) }
 }
 
-// "y"'s link resolution: the entry's own url if it has one, else its DOI
-// turned into a real, resolvable link (not just the bare identifier), else
-// nothing to copy. Pure and DB-free so it's testable without a live
-// clipboard -- see App::copy_url for the actual arboard call.
-// "entry" or "entries" depending on n, for the several footer messages that
-// report how many of a marked/bulk set something happened to.
+// The "y"/"ies" suffix of "entr-" for n, for the footer messages that report
+// how many of a marked/bulk set something happened to.
 fn entries_plural(n: usize) -> &'static str {
     if n == 1 { "y" } else { "ies" }
 }
 
+// "y"'s link resolution: the entry's own url if it has one, else its DOI
+// turned into a real, resolvable link (not just the bare identifier), else
+// nothing to copy. Pure and DB-free so it's testable without a live
+// clipboard -- see App::copy_url for the actual arboard call.
 fn url_for_entry(entry: &Entry) -> Option<String> {
     if let Some(url) = &entry.url {
         return Some(url.clone());
@@ -2452,15 +2413,23 @@ fn draw(frame: &mut Frame, app: &App) {
             selected,
             within_marked,
             ..
-        } => draw_entry_picker(frame, area, candidates, filter, rows, *selected, *within_marked),
+        } => draw_entry_picker(
+            frame,
+            area,
+            candidates,
+            filter,
+            rows,
+            *selected,
+            *within_marked,
+        ),
         Mode::Confirm { message, .. } => draw_confirm(frame, area, message),
         Mode::Help => draw_help(frame, area),
         Mode::FileBrowser {
-            entry_id,
             cwd,
             entries,
             selected,
-        } => draw_file_browser(frame, area, app, *entry_id, cwd, entries, *selected),
+            ..
+        } => draw_file_browser(frame, area, cwd, entries, *selected),
         Mode::Normal | Mode::Input(..) => {}
     }
 }
@@ -2873,6 +2842,31 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+// Shared scaffolding for the list popups: height fitted to the items (clamped
+// to the frame), REVERSED highlight on `selected` when there is anything to
+// select.
+fn draw_list_popup(
+    frame: &mut Frame,
+    frame_area: Rect,
+    width: u16,
+    title: String,
+    items: Vec<ListItem>,
+    selected: usize,
+) {
+    let height = ((items.len() as u16) + 2)
+        .min(frame_area.height.saturating_sub(4))
+        .max(3);
+    let (popup, block) = floating_window(frame, frame_area, width, height, title);
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(selected));
+    }
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, popup, &mut state);
+}
+
 // Centered modal, blanked with Clear first so the panes underneath don't
 // bleed through. Clamped to `frame_area` so it can't overflow a small
 // terminal into a panic-worthy negative size.
@@ -2885,14 +2879,10 @@ fn draw_picker(
     bulk_count: Option<usize>,
 ) {
     let width = frame_area.width.saturating_sub(6).clamp(10, 60);
-    let height = ((rows.len() as u16) + 2)
-        .min(frame_area.height.saturating_sub(4))
-        .max(3);
     let title = match bulk_count {
         Some(n) => format!("File {n} marked into…"),
         None => "File into…".to_string(),
     };
-    let (popup, block) = floating_window(frame, frame_area, width, height, title);
 
     let items: Vec<ListItem> = rows
         .iter()
@@ -2902,14 +2892,7 @@ fn draw_picker(
             ListItem::new(format!("{mark} {indent}{name}"))
         })
         .collect();
-
-    let mut state = ListState::default();
-    state.select(Some(selected));
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, popup, &mut state);
+    draw_list_popup(frame, frame_area, width, title, items, selected);
 }
 
 // "?": the full keymap, grouped the way the footer hints used to be spread
@@ -3003,7 +2986,7 @@ fn draw_help(frame: &mut Frame, frame_area: Rect) {
 }
 
 // The ":" palette -- a small fixed list, titled with the scoped entry's
-// cite_key so it's clear which paper the four actions apply to.
+// cite_key so it's clear which paper the actions apply to.
 fn draw_command(frame: &mut Frame, frame_area: Rect, app: &App, entry_id: i64) {
     let cite_key = app
         .entry_by_id(entry_id)
@@ -3046,10 +3029,6 @@ fn draw_field_picker(
     };
 
     let width = frame_area.width.saturating_sub(6).clamp(20, 70);
-    let height = ((EditField::ALL.len() as u16) + 2)
-        .min(frame_area.height.saturating_sub(4))
-        .max(3);
-    let (popup, block) = floating_window(frame, frame_area, width, height, "Edit field");
 
     let value_width = (width as usize).saturating_sub(14);
     let items: Vec<ListItem> = EditField::ALL
@@ -3059,14 +3038,14 @@ fn draw_field_picker(
             ListItem::new(format!("{:<10}{value}", f.label()))
         })
         .collect();
-
-    let mut state = ListState::default();
-    state.select(Some(selected));
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, popup, &mut state);
+    draw_list_popup(
+        frame,
+        frame_area,
+        width,
+        "Edit field".to_string(),
+        items,
+        selected,
+    );
 }
 
 // Merge's fold-in-entry picker: a filter box folded into the title (there's
@@ -3082,9 +3061,6 @@ fn draw_entry_picker(
     within_marked: bool,
 ) {
     let width = frame_area.width.saturating_sub(6).clamp(20, 70);
-    let height = ((rows.len() as u16) + 2)
-        .min(frame_area.height.saturating_sub(4))
-        .max(3);
     let base_title = if within_marked {
         "Merge into… (marked)"
     } else {
@@ -3095,7 +3071,6 @@ fn draw_entry_picker(
     } else {
         format!("{base_title} /{filter}")
     };
-    let (popup, block) = floating_window(frame, frame_area, width, height, title);
 
     let text_width = (width as usize).saturating_sub(2);
     let items: Vec<ListItem> = rows
@@ -3106,16 +3081,7 @@ fn draw_entry_picker(
             ListItem::new(truncate_display(&label, text_width))
         })
         .collect();
-
-    let mut state = ListState::default();
-    if !rows.is_empty() {
-        state.select(Some(selected));
-    }
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, popup, &mut state);
+    draw_list_popup(frame, frame_area, width, title, items, selected);
 }
 
 // Attach's directory browser: cwd as the title (truncated if too wide,
@@ -3124,18 +3090,15 @@ fn draw_entry_picker(
 fn draw_file_browser(
     frame: &mut Frame,
     frame_area: Rect,
-    _app: &App,
-    _entry_id: i64,
     cwd: &Path,
     entries: &[BrowserEntry],
     selected: usize,
 ) {
     let width = frame_area.width.saturating_sub(6).clamp(20, 70);
-    let height = ((entries.len() as u16) + 2)
-        .min(frame_area.height.saturating_sub(4))
-        .max(3);
-    let title = truncate_display(&cwd.display().to_string(), (width as usize).saturating_sub(2));
-    let (popup, block) = floating_window(frame, frame_area, width, height, title);
+    let title = truncate_display(
+        &cwd.display().to_string(),
+        (width as usize).saturating_sub(2),
+    );
 
     let text_width = (width as usize).saturating_sub(2);
     let items: Vec<ListItem> = entries
@@ -3149,16 +3112,7 @@ fn draw_file_browser(
             ListItem::new(truncate_display(&label, text_width))
         })
         .collect();
-
-    let mut state = ListState::default();
-    if !entries.is_empty() {
-        state.select(Some(selected));
-    }
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, popup, &mut state);
+    draw_list_popup(frame, frame_area, width, title, items, selected);
 }
 
 // Delete/merge confirmation: just the message, sized to fit it.
@@ -3264,30 +3218,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing entry {name}"))
                 .is_dir
         };
-        assert!(is_dir_of("dir_link"), "symlink to a directory must classify as a directory");
-        assert!(!is_dir_of("broken_link"), "a broken symlink must not classify as a directory");
+        assert!(
+            is_dir_of("dir_link"),
+            "symlink to a directory must classify as a directory"
+        );
+        assert!(
+            !is_dir_of("broken_link"),
+            "a broken symlink must not classify as a directory"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn path_reconstruction_matches_depth_stack() {
-        let tree = vec![
-            (0, mk_collection(1, "Physics")),
-            (1, mk_collection(2, "Entropy")),
-            (0, mk_collection(3, "Biology")),
-        ];
-        let paths = db::collection_tree_paths(&tree);
-        assert_eq!(paths, vec!["Physics", "Physics/Entropy", "Biology"]);
-    }
-
-    fn mk_collection(id: i64, name: &str) -> db::Collection {
-        db::Collection {
-            id,
-            name: name.to_string(),
-            parent_id: None,
-            entry_count: 0,
-        }
     }
 
     #[test]
@@ -3516,8 +3456,7 @@ mod tests {
     // being written down as a fixture.
     #[test]
     fn details_scroll_uses_real_word_wrap_not_naive_division() {
-        let text =
-            "alpha bee car delta elephant fig grape house ivy jelly kangaroo lemon mango";
+        let text = "alpha bee car delta elephant fig grape house ivy jelly kangaroo lemon mango";
         let width = 17u16;
         let naive_estimate = (text.chars().count() as u16).div_ceil(width);
         assert_eq!(naive_estimate, 5, "sanity check on the fixture itself");
@@ -3675,7 +3614,11 @@ mod tests {
         app.begin_merge(&conn, visible_id);
         match &app.mode {
             Mode::EntryPicker { rows, .. } => {
-                assert_eq!(rows.len(), 2, "both other marked entries should be candidates");
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "both other marked entries should be candidates"
+                );
             }
             _ => panic!("expected EntryPicker mode"),
         }
@@ -3725,7 +3668,11 @@ mod tests {
         else {
             panic!("expected EntryPicker mode");
         };
-        assert_eq!(app.entries.len(), 1, "candidates must not be appended to entries");
+        assert_eq!(
+            app.entries.len(),
+            1,
+            "candidates must not be appended to entries"
+        );
 
         handle_entry_picker_key(
             &mut app,
@@ -3740,9 +3687,15 @@ mod tests {
         );
 
         app.rebuild_view();
-        assert_eq!(app.entries.len(), 1, "entries must still be just the local collection");
+        assert_eq!(
+            app.entries.len(),
+            1,
+            "entries must still be just the local collection"
+        );
         assert!(
-            app.view.iter().all(|&i| app.entries[i].id != Some(elsewhere_id)),
+            app.view
+                .iter()
+                .all(|&i| app.entries[i].id != Some(elsewhere_id)),
             "the foreign entry must never appear in view"
         );
 
@@ -3774,7 +3727,11 @@ mod tests {
         let mut app = mk_app(vec![alpha, beta, gamma]);
         app.sort_key = SortKey::Title;
         app.rebuild_view(); // Alpha, Beta, Gamma
-        app.table_selected = app.view.iter().position(|&i| app.entries[i].id == Some(gamma_id)).unwrap();
+        app.table_selected = app
+            .view
+            .iter()
+            .position(|&i| app.entries[i].id == Some(gamma_id))
+            .unwrap();
         app.details_scroll = 7; // an old, now-meaningless scroll offset
 
         app.apply_field_edit(&conn, gamma_id, EditField::Title, "Aardvark");
@@ -3821,7 +3778,9 @@ mod tests {
         app.refresh_entry(&conn, tagged_id).unwrap();
 
         assert!(
-            app.view.iter().all(|&i| app.entries[i].id != Some(tagged_id)),
+            app.view
+                .iter()
+                .all(|&i| app.entries[i].id != Some(tagged_id)),
             "the untagged entry should have dropped out of the active filter"
         );
         assert_eq!(app.details_scroll, 0);
@@ -3865,7 +3824,11 @@ mod tests {
         let child_id = db::create_collection(&conn, "Physics/Entropy").unwrap();
 
         let mut app = App::load(&conn).unwrap();
-        app.selected_row = app.rows.iter().position(|r| r.id == Some(child_id)).unwrap();
+        app.selected_row = app
+            .rows
+            .iter()
+            .position(|r| r.id == Some(child_id))
+            .unwrap();
 
         app.begin_delete_collection();
         let (id, parent_id_captured) = match app.mode {
@@ -3900,12 +3863,18 @@ mod tests {
         assert_eq!(app.rows[0].id, None, "row 0 must be the 'All Papers' root");
 
         app.begin_rename_collection();
-        assert!(matches!(app.mode, Mode::Normal), "R must not open an input on this row");
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "R must not open an input on this row"
+        );
         assert!(app.status.is_some(), "R must leave an explanatory status");
 
         app.status = None;
         app.begin_delete_collection();
-        assert!(matches!(app.mode, Mode::Normal), "D must not open a confirm on this row");
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "D must not open a confirm on this row"
+        );
         assert!(app.status.is_some(), "D must leave an explanatory status");
 
         std::fs::remove_dir_all(&dir).ok();

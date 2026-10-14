@@ -228,10 +228,6 @@ fn insert_authors(conn: &Connection, entry_id: i64, authors: &[Author]) -> Resul
     Ok(())
 }
 
-// Takes &Connection (not &mut) per the spec, so the transaction is opened
-// with `unchecked_transaction` rather than `Connection::transaction`, which
-// requires &mut self. Still a real transaction — entry + authors commit or
-// roll back together.
 // Returns the cite_key of the entry already carrying `doi`, if there is one.
 //
 // A DOI names one specific paper, so two entries holding the same DOI are the
@@ -283,6 +279,10 @@ fn reject_duplicate_doi(conn: &Connection, entry: &Entry, exclude_id: Option<i64
     }
 }
 
+// Takes &Connection (not &mut) per the spec, so the transaction is opened
+// with `unchecked_transaction` rather than `Connection::transaction`, which
+// requires &mut self. Still a real transaction — entry + authors commit or
+// roll back together.
 pub fn insert_entry(conn: &Connection, entry: &Entry) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
     reject_duplicate_doi(&tx, entry, None)?;
@@ -327,18 +327,17 @@ pub fn insert_entry(conn: &Connection, entry: &Entry) -> Result<i64> {
 }
 
 pub fn get_entry(conn: &Connection, cite_key: &str) -> Result<Option<Entry>> {
-    let mut stmt = conn.prepare("SELECT * FROM entries WHERE cite_key = ?1")?;
-    let mut rows = stmt.query([cite_key])?;
-
-    let Some(row) = rows.next()? else {
-        return Ok(None);
-    };
-
-    let mut entry = entry_from_row(row)?;
-    entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
-    entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
-    entry.attachments = attachments_for_entry(conn, entry.id.unwrap(), true)?;
-    Ok(Some(entry))
+    let id = conn
+        .query_row(
+            "SELECT id FROM entries WHERE cite_key = ?1",
+            [cite_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match id {
+        Some(id) => get_entry_by_id(conn, id),
+        None => Ok(None),
+    }
 }
 
 // Same as get_entry, but keyed by id instead of cite_key -- used where a
@@ -353,18 +352,16 @@ pub fn get_entry_by_id(conn: &Connection, id: i64) -> Result<Option<Entry>> {
     };
 
     let mut entry = entry_from_row(row)?;
-    entry.authors = authors_for_entry(conn, entry.id.unwrap())?;
-    entry.tags = tags_for_entry(conn, entry.id.unwrap())?;
-    entry.attachments = attachments_for_entry(conn, entry.id.unwrap(), true)?;
+    entry.authors = authors_for_entry(conn, id)?;
+    entry.tags = tags_for_entry(conn, id)?;
+    entry.attachments = attachments_for_entry(conn, id, true)?;
     Ok(Some(entry))
 }
 
 pub fn cite_key_for_id(conn: &Connection, id: i64) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT cite_key FROM entries WHERE id = ?1",
-        [id],
-        |row| row.get(0),
-    )
+    conn.query_row("SELECT cite_key FROM entries WHERE id = ?1", [id], |row| {
+        row.get(0)
+    })
     .optional()
 }
 
@@ -386,27 +383,21 @@ pub fn attachments_for_entry(
     entry_id: i64,
     with_full_text: bool,
 ) -> Result<Vec<Attachment>> {
-    if with_full_text {
-        let mut stmt = conn
-            .prepare("SELECT path, full_text FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
-        stmt.query_map([entry_id], |row| {
-            Ok(Attachment {
-                path: row.get(0)?,
-                full_text: row.get(1)?,
-            })
-        })?
-        .collect::<Result<Vec<Attachment>>>()
+    let cols = if with_full_text {
+        "path, full_text"
     } else {
-        let mut stmt =
-            conn.prepare("SELECT path FROM attachments WHERE entry_id = ?1 ORDER BY id")?;
-        stmt.query_map([entry_id], |row| {
-            Ok(Attachment {
-                path: row.get(0)?,
-                full_text: None,
-            })
-        })?
-        .collect::<Result<Vec<Attachment>>>()
-    }
+        "path, NULL"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {cols} FROM attachments WHERE entry_id = ?1 ORDER BY id"
+    ))?;
+    stmt.query_map([entry_id], |row| {
+        Ok(Attachment {
+            path: row.get(0)?,
+            full_text: row.get(1)?,
+        })
+    })?
+    .collect::<Result<Vec<Attachment>>>()
 }
 
 // Records a path. This function never copies anything -- `main::copy_into_library`
@@ -528,9 +519,6 @@ pub fn normalize_tag(raw: &str) -> std::result::Result<String, String> {
     Ok(name)
 }
 
-// Idempotent: returns Ok(false) (not an error) if the entry already had the
-// tag. An unknown cite_key is a real error (QueryReturnedNoRows), same as
-// update_entry's id lookup.
 // Tagging by entry id, shared by `add_tag` (which resolves a cite_key first)
 // and `insert_entry` (which already holds the id it just wrote). Takes an
 // already-normalized name.
@@ -549,6 +537,9 @@ fn attach_tag(conn: &Connection, entry_id: i64, name: &str) -> Result<bool> {
     Ok(conn.changes() > 0)
 }
 
+// Idempotent: returns Ok(false) (not an error) if the entry already had the
+// tag. An unknown cite_key is a real error (QueryReturnedNoRows), same as
+// update_entry's id lookup.
 pub fn add_tag(conn: &Connection, cite_key: &str, tag: &str) -> Result<bool> {
     let name = normalize_tag(tag).map_err(rusqlite::Error::InvalidParameterName)?;
     let tx = conn.unchecked_transaction()?;
@@ -617,6 +608,17 @@ fn split_path(path: &str) -> std::result::Result<Vec<String>, String> {
     path.split('/').map(validate_collection_name).collect()
 }
 
+// Id of the collection named `name` (case-insensitively) directly under
+// `parent` (None = root). `IS` rather than `=` so the NULL parent matches.
+fn sibling_named(conn: &Connection, parent: Option<i64>, name: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
+        rusqlite::params![name, parent],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 // Resolves a slash-separated path to a collection id, walking one segment at
 // a time. An invalid path (e.g. an empty segment) simply can't match
 // anything real -- creating one is rejected by create_collection -- so this
@@ -630,14 +632,7 @@ pub fn collection_by_path(conn: &Connection, path: &str) -> Result<Option<i64>> 
     for seg in segments {
         // `IS` rather than `=` so this is null-safe: with current = NULL,
         // "parent_id IS ?" correctly matches root-level collections.
-        let found: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
-                rusqlite::params![seg, current],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match found {
+        match sibling_named(conn, current, &seg)? {
             Some(id) => current = Some(id),
             None => return Ok(None),
         }
@@ -650,7 +645,7 @@ pub fn collection_by_path(conn: &Connection, path: &str) -> Result<Option<i64>> 
 // add_tag, remove_tag, add_to_collection, remove_from_collection, and
 // update_entry all did this inline, each with its own "same as attach" or
 // "same as add_tag" comment pointing at one of the others. An unknown
-// cite_key is Err(QueryReturnedNoRows), which `main::entry_error` turns
+// cite_key is Err(QueryReturnedNoRows), which `main::friendly` turns
 // into "no entry found with cite_key '...'" for the user -- that mapping
 // lives at the call site since only the caller knows what action to name
 // in the fallback "failed to {action}" case.
@@ -663,7 +658,7 @@ fn entry_id_for(conn: &Connection, cite_key: &str) -> Result<i64> {
 }
 
 // Resolves a collection path or fails with a message already written for a
-// human (InvalidParameterName, which `main::db_error` passes straight
+// human (InvalidParameterName, which `main::friendly` passes straight
 // through) -- the same "not found" case `collection_by_path` alone leaves
 // as a bare `None` for callers that can't just skip a missing collection.
 pub fn require_collection(conn: &Connection, path: &str) -> Result<i64> {
@@ -681,14 +676,7 @@ pub fn require_collection(conn: &Connection, path: &str) -> Result<i64> {
 pub fn create_collection_under(conn: &Connection, parent: Option<i64>, name: &str) -> Result<i64> {
     let seg = validate_collection_name(name).map_err(rusqlite::Error::InvalidParameterName)?;
 
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
-            rusqlite::params![seg, parent],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match existing {
+    match sibling_named(conn, parent, &seg)? {
         Some(id) => Ok(id),
         None => {
             conn.execute(
@@ -887,14 +875,7 @@ pub fn rename_collection(conn: &Connection, id: i64, new_name: &str) -> Result<(
         |row| row.get(0),
     )?;
 
-    let sibling: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM collections WHERE lower(name) = lower(?1) AND parent_id IS ?2",
-            rusqlite::params![name, parent_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(sibling_id) = sibling
+    if let Some(sibling_id) = sibling_named(conn, parent_id, &name)?
         && sibling_id != id
     {
         return Err(rusqlite::Error::InvalidParameterName(format!(
@@ -941,11 +922,11 @@ pub fn collection_tree(conn: &Connection) -> Result<Vec<(usize, Collection)>> {
         if !visited.insert(id) {
             continue; // already rendered -- part of a cycle
         }
-        if depth <= 32 {
-            if let Some(kids) = children.get(&Some(id)) {
-                for &k in kids.iter().rev() {
-                    stack.push((k, depth + 1));
-                }
+        if depth <= 32
+            && let Some(kids) = children.get(&Some(id))
+        {
+            for &k in kids.iter().rev() {
+                stack.push((k, depth + 1));
             }
         }
         if let Some(c) = by_id.remove(&id) {
@@ -962,8 +943,7 @@ pub fn collection_tree(conn: &Connection) -> Result<Vec<(usize, Collection)>> {
 }
 
 // Slash-joined path for every row of a collection_tree() walk, same order.
-// Same stack-truncation algorithm `collection ls --json` builds inline in
-// main.rs -- factored out here so the TUI doesn't hand-roll a third copy.
+// Shared by `collection ls --json` (main.rs) and the TUI.
 pub fn collection_tree_paths(tree: &[(usize, Collection)]) -> Vec<String> {
     let mut stack: Vec<&str> = Vec::new();
     tree.iter()
@@ -1331,8 +1311,8 @@ pub fn delete_entry(conn: &Connection, cite_key: &str) -> Result<()> {
 // Attachments physically live at ./pdfs/<cite_key>.<ext> (Phase 12), so a
 // drop-side file's name stops matching the naming convention once its row
 // points at keep_id. Each one is renamed onto a name built from keep's
-// cite_key, claimed with the same O_EXCL discipline main.rs's
-// copy_into_library/land_downloaded_pdf use for the identical race: never
+// cite_key, claimed with the same O_EXCL discipline as main.rs's
+// claim_free_name (and copy_into_library's own loop) for the identical race: never
 // overwrite a file that's already there; if the natural name is taken by an
 // unrelated attachment keep already has, fall back to "-2", "-3", ...
 pub fn merge_entries(conn: &Connection, keep_id: i64, drop_id: i64) -> Result<()> {
@@ -1482,8 +1462,8 @@ fn move_attachment(
 }
 
 // Claims a free `<base>.<ext>` / `<base>-2.<ext>` / ... filename in `dir`,
-// via the same O_EXCL race-proof claim `main::copy_into_library` uses for
-// the identical problem. The empty file this claims is what merge_entries's
+// via `main::claim_free_name`, the same O_EXCL race-proof claim
+// attach/fetch use for the identical problem. The empty file this claims is what merge_entries's
 // std::fs::rename then overwrites.
 fn claim_attachment_name(dir: &Path, base: &str, ext: &str) -> Result<std::path::PathBuf> {
     crate::claim_free_name(dir, base, ext).map_err(|e| {
@@ -1803,16 +1783,16 @@ mod tests {
         seed(&conn, "b", "Graph Theory", 2024, "Smithson", "Jane");
 
         // tag -> get_entry sees it; tagging again is a no-op, no duplicate.
-        assert_eq!(add_tag(&conn, "a", "ml").unwrap(), true);
-        assert_eq!(add_tag(&conn, "a", "ml").unwrap(), false);
+        assert!(add_tag(&conn, "a", "ml").unwrap());
+        assert!(!add_tag(&conn, "a", "ml").unwrap());
         assert_eq!(
             get_entry(&conn, "a").unwrap().unwrap().tags,
             vec!["ml".to_string()]
         );
 
         // untag: true, then false the second time.
-        assert_eq!(remove_tag(&conn, "a", "ml").unwrap(), true);
-        assert_eq!(remove_tag(&conn, "a", "ml").unwrap(), false);
+        assert!(remove_tag(&conn, "a", "ml").unwrap());
+        assert!(!remove_tag(&conn, "a", "ml").unwrap());
         assert!(get_entry(&conn, "a").unwrap().unwrap().tags.is_empty());
 
         // Unknown cite_key is a real error, not a silent no-op.
@@ -2069,13 +2049,10 @@ mod tests {
         seed(&conn, "a", "Paper", 2024, "Smith", "John");
         create_collection(&conn, "Physics").unwrap();
 
-        assert_eq!(add_to_collection(&conn, "Physics", "a").unwrap(), true);
-        assert_eq!(add_to_collection(&conn, "Physics", "a").unwrap(), false);
-        assert_eq!(remove_from_collection(&conn, "Physics", "a").unwrap(), true);
-        assert_eq!(
-            remove_from_collection(&conn, "Physics", "a").unwrap(),
-            false
-        );
+        assert!(add_to_collection(&conn, "Physics", "a").unwrap());
+        assert!(!add_to_collection(&conn, "Physics", "a").unwrap());
+        assert!(remove_from_collection(&conn, "Physics", "a").unwrap());
+        assert!(!remove_from_collection(&conn, "Physics", "a").unwrap());
 
         assert!(add_to_collection(&conn, "Physics", "nonexistent").is_err());
         assert!(add_to_collection(&conn, "NoSuchCollection", "a").is_err());
@@ -2215,7 +2192,7 @@ mod tests {
 
         // A legitimate move still works.
         assert!(move_collection(&conn, "A/B/C", None).is_ok());
-        assert_eq!(collection_by_path(&conn, "C").unwrap().is_some(), true);
+        assert!(collection_by_path(&conn, "C").unwrap().is_some());
     }
 
     // The TUI reconstructs paths from collection_tree's pre-order walk the
@@ -2883,7 +2860,10 @@ mod tests {
 
         merge_entries(&conn, keep_id, drop_id).unwrap();
 
-        assert!(shared_pdf.is_file(), "the shared file must survive untouched");
+        assert!(
+            shared_pdf.is_file(),
+            "the shared file must survive untouched"
+        );
 
         let kept = get_entry(&conn, "keep2024").unwrap().unwrap();
         assert_eq!(kept.attachments.len(), 1);
@@ -2964,7 +2944,10 @@ mod tests {
 
         assert!(require_collection(&conn, "Physics").is_ok());
         let err = require_collection(&conn, "Pyhsics"); // typo
-        assert!(err.is_err(), "an unresolvable path must be an error, not None/empty");
+        assert!(
+            err.is_err(),
+            "an unresolvable path must be an error, not None/empty"
+        );
     }
 
     // Phase 29: rename_collection mirrors create_collection_under's

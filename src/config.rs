@@ -69,10 +69,10 @@ fn read_config_email() -> Option<String> {
 // you run it from. install.sh sets FERREF_HOME when the user picks a
 // non-default location; otherwise this falls through to the standard one.
 pub fn library_root() -> Result<PathBuf, String> {
-    if let Ok(dir) = std::env::var("FERREF_HOME") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
-        }
+    if let Ok(dir) = std::env::var("FERREF_HOME")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir));
     }
     std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join(".ferref"))
@@ -92,10 +92,10 @@ pub fn resolve_email(cli_email: Option<String>) -> Result<String, String> {
     {
         return Ok(email);
     }
-    if let Ok(email) = std::env::var("FERREF_EMAIL") {
-        if !email.trim().is_empty() {
-            return Ok(email);
-        }
+    if let Ok(email) = std::env::var("FERREF_EMAIL")
+        && !email.trim().is_empty()
+    {
+        return Ok(email);
     }
     if let Some(email) = read_config_email() {
         return Ok(email);

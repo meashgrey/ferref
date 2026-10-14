@@ -9,11 +9,11 @@ use biblatex::{
     PermissiveType, Person, RawBibliography, RawChunk, RawEntry, Type,
 };
 
-use crate::cli::validate_cite_key;
+use crate::cli::{validate_cite_key, validate_title};
 use crate::models::{Author, Entry};
 
 // Entries parsed successfully, and entries rejected during parsing itself
-// (currently just a missing/empty title -- see from_biblatex) as
+// (a missing/empty title or an invalid cite key -- see from_biblatex) as
 // (cite_key, reason) pairs -- the same shape cmd_import already uses for
 // entries rejected at insert time, so the two can be merged into one report.
 type ImportResult = (Vec<Entry>, Vec<(String, String)>);
@@ -196,9 +196,7 @@ fn from_biblatex(e: &BibEntry) -> Result<Entry, String> {
         .map(|c| c.format_verbatim())
         .unwrap_or_default();
 
-    if title.trim().is_empty() {
-        return Err(format!("entry '{}' has no title", e.key));
-    }
+    validate_title(&title).map_err(|_| format!("entry '{}' has no title", e.key))?;
 
     let mut entry = Entry::new(entry_type, e.key.clone(), title);
 
@@ -645,38 +643,37 @@ mod tests {
     // "LIGO Scientific Collaboration and Virgo Collaboration" is exactly
     // this: one author, no given name. Unbraced, that splits into two
     // authors on re-import; brace-protected, it must come back as one.
+    // The second case is the comma half of the same bug -- BibTeX's
+    // plain-Person parser reads an unbraced comma as "Last, First".
     #[test]
-    fn organization_author_with_and_survives_round_trip() {
-        let mut entry = Entry::new("article".into(), "ligo2016".into(), "T".into());
-        entry.add_author(Author::new(
-            "LIGO Scientific Collaboration and Virgo Collaboration".into(),
-            None,
-        ));
-        entry.add_author(Author::new("Smith".into(), Some("John".into())));
-
-        let back = round_trip(entry);
-        assert_eq!(back.authors.len(), 2);
-        assert_eq!(
-            back.authors[0].last_name,
-            "LIGO Scientific Collaboration and Virgo Collaboration"
-        );
-        assert_eq!(back.authors[0].first_name, None);
-        assert_eq!(back.authors[1].last_name, "Smith");
-        assert_eq!(back.authors[1].first_name, Some("John".to_string()));
-    }
-
-    // An organization name containing a comma is the other half of the same
-    // bug -- BibTeX's plain-Person parser reads an unbraced comma as
-    // "Last, First".
-    #[test]
-    fn organization_author_with_comma_survives_round_trip() {
-        let mut entry = Entry::new("article".into(), "org2020".into(), "T".into());
-        entry.add_author(Author::new("Some Org, Inc.".into(), None));
-
-        let back = round_trip(entry);
-        assert_eq!(back.authors.len(), 1);
-        assert_eq!(back.authors[0].last_name, "Some Org, Inc.");
-        assert_eq!(back.authors[0].first_name, None);
+    fn organization_authors_survive_round_trip() {
+        type Names = Vec<(&'static str, Option<&'static str>)>;
+        let cases: Vec<(&str, Names)> = vec![
+            (
+                "with 'and'",
+                vec![
+                    (
+                        "LIGO Scientific Collaboration and Virgo Collaboration",
+                        None,
+                    ),
+                    ("Smith", Some("John")),
+                ],
+            ),
+            ("with comma", vec![("Some Org, Inc.", None)]),
+        ];
+        for (label, names) in cases {
+            let mut entry = Entry::new("article".into(), "org2020".into(), "T".into());
+            for (last, first) in &names {
+                entry.add_author(Author::new(last.to_string(), first.map(String::from)));
+            }
+            let back = round_trip(entry);
+            let got: Vec<(&str, Option<&str>)> = back
+                .authors
+                .iter()
+                .map(|a| (a.last_name.as_str(), a.first_name.as_deref()))
+                .collect();
+            assert_eq!(got, names, "{label}");
+        }
     }
 
     // The two things a BibTeX -> LaTeX pipeline actually loses: tags, which

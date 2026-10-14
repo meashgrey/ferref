@@ -56,9 +56,9 @@ Essential features that should be present at the end:
 - Some kind of intuitive directory structure where PDFs are stored. 
 - A field to link authors to ORCID IDs if available. 
 
-## Current state (2026-08-24)
+## Current state (2026-10-14)
 
-All fifteen phases are complete.
+Phases through 29 are complete (27 deferred). The module table in `docs/design.md` is the up-to-date map; the bullets below are per-module notes.
 
 - `src/models.rs` — `Entry`/`Author` + `now()`. `Serialize` derived; `abstract_text` serializes as `"abstract"` (Rust reserves `abstract`), locked by a test.
 - `src/db.rs` — schema + `insert_entry`/`get_entry`/`list_entries`/`update_entry`/`delete_entry`, all free functions over `&Connection`. `update_entry` stamps `date_modified` itself so callers can't forget. `list_entries` takes a `Filter`; an all-`None` filter matches everything, so `list` and `search` are one query. `add_tag`/`remove_tag` are idempotent and report whether anything changed; `normalize_tag` (trim + lowercase) is the single point both writes and the `tag` filter go through. `attach` copies the file into `./pdfs/` under the same `<cite_key>.<ext>` scheme `fetch` uses, and stores the copy's path, so a library is one directory of papers. The name is claimed with `O_EXCL`, not by checking whether it exists first — two concurrent attaches to one cite_key otherwise lose a file 23% of the time, each reporting success.
@@ -67,9 +67,9 @@ All fifteen phases are complete.
 - `src/doi.rs` — Crossref metadata + Unpaywall OA lookup over `ureq`. The network trust boundary: every request goes through `fetch_guarded`, which follows redirects by hand so each hop's scheme and resolved IP are revalidated, with capped reads and a `%PDF` magic-byte check before anything is written. `fetch` (Phase 19) falls back past Unpaywall to four more OA sources when it comes up empty — arXiv/OSF/preprints.org are pure DOI-pattern-to-URL resolvers, bioRxiv/medRxiv is one JSON API call — all landing on the same `download_pdf` trust boundary as Unpaywall's own URL.
 - `src/config.rs` — reads one key (`email`) from `~/.config/ferref/config.toml`. Deliberately a line reader, not TOML, and not a settings system.
 - Collections (Phase 10) nest; tags (Phase 5) don't. A tag describes a paper, a collection is where it lives. `collection_tree` is the single traversal, and it terminates on a cyclic `parent_id` graph because the DB is hand-editable by design.
-- `src/tui.rs` — three-pane TUI over ratatui. Blocking `event::read()`, DB queried only on state change, and `Filter` addressed by collection **id** rather than path. Sorts, filters, creates collections and files papers into them (Phase 12); everything else is still CLI-only.
-- `src/cli.rs` — clap derive types for `add`/`list`/`show`/`edit`/`rm`/`search`/`import`/`export`, plus `parse_author`.
-- `src/main.rs` — thin dispatcher; the four biggest commands (`attach`, `extract`, `import`, `fetch`) live in their own `cmd_*` functions rather than inline match arms, the same shape `dispatch_collection` already had. All JSON goes through `emit_json`, which streams to stdout instead of building the document as a `String` first — that halved peak memory on `list --full-text --json`. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
+- `src/tui.rs` — three-pane TUI over ratatui. Blocking `event::read()`, DB queried only on state change, and `Filter` addressed by collection **id** rather than path. Browses, sorts, filters, edits fields, tags, fetches/attaches PDFs, merges entries, and manages collections (create/rename/delete/file into) without leaving the terminal.
+- `src/cli.rs` — clap derive types for every subcommand, plus `parse_author` and the shared input validators.
+- `src/main.rs` — CLI dispatch plus the logic the TUI shares with it (PMC-first `fetch`, PDF landing/`O_EXCL` name claiming, `doctor`, error mapping in `friendly`). All JSON goes through `emit_json`, which streams to stdout instead of building the document as a `String` first — that halved peak memory on `list --full-text --json`. All stdout goes through `emit()`, which exits 0 on a closed pipe instead of panicking. Failures exit non-zero with the message on stderr.
 
 ### Known limitations
 
@@ -115,7 +115,8 @@ All fifteen phases are complete.
 - Attachment paths are absolute and stored at attach time. `attach` and `fetch`
   both copy into `./pdfs/`, so the files travel with the library — but the
   stored paths don't, and moving the library directory breaks every one of them
-  silently. Nothing revalidates them.
+  silently. `doctor` reports paths that no longer resolve (and `--fix` detaches
+  them), but nothing repairs a moved library.
 - BibTeX export writes legacy BibTeX unless `--biblatex` is passed. That's a
   real fork, not a quality setting: BibLaTeX keeps `@online`/`@dataset` and
   writes `date`/`journaltitle`, which legacy BibTeX styles don't read. Tags

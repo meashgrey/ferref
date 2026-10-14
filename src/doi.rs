@@ -48,7 +48,7 @@ const MAX_REDIRECTS: usize = 10;
 
 /// Fetches Crossref metadata for `doi` and maps it onto an `Entry`. The
 /// returned entry has an empty `cite_key` -- deriving/choosing one is the
-/// caller's job (see `cli::derive_cite_key` used by `add --doi`).
+/// caller's job (see `derive_cite_key` in main.rs, used by `add --doi`).
 pub fn fetch_metadata(doi: &str) -> Result<Entry, String> {
     validate_doi(doi)?;
     let url = format!("{CROSSREF_BASE}/{}", percent_encode(doi));
@@ -155,8 +155,7 @@ pub fn preprints_org_pdf_url(doi: &str) -> Option<String> {
     let rest = &doi[PREFIX.len()..];
     let manuscript = &rest[..pos];
     let version = &rest[pos + 2..];
-    if manuscript.is_empty() || version.is_empty() || !version.chars().all(|c| c.is_ascii_digit())
-    {
+    if manuscript.is_empty() || version.is_empty() || !version.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
     Some(format!(
@@ -364,10 +363,6 @@ fn validate_doi(doi: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn has_pdf_magic(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"%PDF")
-}
-
 /// Turns a cite_key into a safe filename component for `./pdfs/<key>.pdf`.
 /// cite_key is user- and BibTeX-controlled and is about to be used as a
 /// filesystem path, so anything outside `[A-Za-z0-9._-]` is replaced with
@@ -393,13 +388,6 @@ pub fn sanitize_filename(cite_key: &str) -> Result<String, String> {
     Ok(sanitized)
 }
 
-// Shared GET+status-check+size-capped-read for both APIs. `http_status_as_error`
-// is turned off so a 4xx/5xx comes back as Ok(response) instead of Err,
-// letting the status be checked explicitly here -- ureq 3.4's own default is
-// actually the opposite -- its `http_status_as_error` defaults to true -- but
-// checking it
-// ourselves either way is the point: a raw status dump is not an
-// actionable error message.
 /// Fetches a publisher landing page and reads its Highwire Press `citation_*`
 /// meta tags. Same guarded fetch as everything else here, so redirects are
 /// revalidated per hop and internal addresses are refused.
@@ -476,14 +464,14 @@ fn parse_citation_meta(html: &str, base: &Uri) -> PageMetadata {
             "citation_author" => meta.authors.push(content),
             // Dates come as "2020", "2020/07/16", "2020-07-16". Only the year
             // is stored, so take the leading four digits and ignore the rest.
-            "citation_publication_date" | "citation_date" | "citation_year" => {
-                if meta.year.is_none() {
-                    meta.year = content
-                        .trim()
-                        .get(..4)
-                        .and_then(|y| y.parse::<i32>().ok())
-                        .filter(|y| (1000..=9999).contains(y));
-                }
+            "citation_publication_date" | "citation_date" | "citation_year"
+                if meta.year.is_none() =>
+            {
+                meta.year = content
+                    .trim()
+                    .get(..4)
+                    .and_then(|y| y.parse::<i32>().ok())
+                    .filter(|y| (1000..=9999).contains(y));
             }
             _ => {}
         }
@@ -742,6 +730,9 @@ fn fetch_guarded_with(
 ) -> Result<(Vec<u8>, String), String> {
     let agent: Agent = Agent::config_builder()
         .timeout_global(Some(timeout))
+        // A 4xx/5xx comes back as Ok(response) so the status can be checked
+        // explicitly below -- a raw ureq status error isn't an actionable
+        // message.
         .http_status_as_error(false)
         // We follow redirects ourselves so each hop can be revalidated.
         .max_redirects(0)
@@ -834,7 +825,7 @@ fn read_pdf_body(resp: Response<ureq::Body>, limit: u64, what: &str) -> Result<V
     let mut reader = resp.into_body().into_reader();
     let mut magic = [0u8; 4];
     match reader.read_exact(&mut magic) {
-        Ok(()) if has_pdf_magic(&magic) => {}
+        Ok(()) if magic.starts_with(b"%PDF") => {}
         // A body shorter than four bytes can't be a PDF either -- treated
         // the same as a mismatched one, not a distinct I/O error.
         Ok(()) => return Err(not_a_pdf()),
@@ -1009,7 +1000,6 @@ fn map_entry_type(crossref_type: &str) -> String {
         "proceedings-article" => "inproceedings",
         "book-chapter" => "incollection",
         "book" => "book",
-        "posted-content" => "misc",
         _ => "misc",
     }
     .to_string()
@@ -1226,8 +1216,12 @@ mod tests {
     // Crossref error (network, rate limit, ...) must stay fatal.
     #[test]
     fn is_no_record_404_matches_only_the_no_record_message() {
-        assert!(is_no_record_404("Crossref has no record for this DOI (404)"));
-        assert!(!is_no_record_404("Crossref rate limit exceeded (429); try again later"));
+        assert!(is_no_record_404(
+            "Crossref has no record for this DOI (404)"
+        ));
+        assert!(!is_no_record_404(
+            "Crossref rate limit exceeded (429); try again later"
+        ));
         assert!(!is_no_record_404("failed to reach Crossref: network error"));
     }
 
@@ -1380,44 +1374,31 @@ mod tests {
     }
 
     // Real shape (fields trimmed) from Unpaywall's documented API response,
-    // https://unpaywall.org/products/api -- a PDF URL under best_oa_location.
+    // https://unpaywall.org/products/api
     #[test]
-    fn parses_unpaywall_response_with_pdf() {
-        let json = r#"
-        {
-          "doi": "10.1371/journal.pone.0000308",
-          "is_oa": true,
-          "best_oa_location": {
-            "url_for_pdf": "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0000308&type=printable",
-            "host_type": "publisher",
-            "license": "cc-by"
-          }
-        }
-        "#;
-        assert_eq!(
-            parse_unpaywall(json).unwrap().pdf_urls,
-            vec![
-                "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0000308&type=printable"
-                    .to_string()
-            ]
+    fn parses_unpaywall_pdf_urls() {
+        let plos = "https://journals.plos.org/plosone/article/file?id=10.1371/journal.pone.0000308&type=printable";
+        let with_pdf = format!(
+            r#"{{"is_oa": true, "best_oa_location": {{"url_for_pdf": "{plos}", "host_type": "publisher"}}}}"#
         );
-    }
-
-    // No legal OA copy: best_oa_location is null. This is Ok(empty), not an
-    // error.
-    #[test]
-    fn parses_unpaywall_response_with_no_oa_copy() {
-        let json = r#"{ "doi": "10.1/paywalled", "is_oa": false, "best_oa_location": null }"#;
-        assert!(parse_unpaywall(json).unwrap().pdf_urls.is_empty());
-    }
-
-    // url_for_pdf itself can be null even when best_oa_location isn't.
-    #[test]
-    fn parses_unpaywall_response_with_null_pdf_url() {
-        let json = r#"
-        { "best_oa_location": { "url_for_pdf": null, "host_type": "repository" } }
-        "#;
-        assert!(parse_unpaywall(json).unwrap().pdf_urls.is_empty());
+        let cases = [
+            ("with pdf", with_pdf.as_str(), vec![plos.to_string()]),
+            // No legal OA copy: best_oa_location is null. Ok(empty), not an error.
+            (
+                "no oa copy",
+                r#"{"is_oa": false, "best_oa_location": null}"#,
+                vec![],
+            ),
+            // url_for_pdf itself can be null even when best_oa_location isn't.
+            (
+                "null pdf url",
+                r#"{"best_oa_location": {"url_for_pdf": null}}"#,
+                vec![],
+            ),
+        ];
+        for (label, json, expected) in cases {
+            assert_eq!(parse_unpaywall(json).unwrap().pdf_urls, expected, "{label}");
+        }
     }
 
     fn meta_of(html: &str) -> PageMetadata {
@@ -1499,29 +1480,42 @@ mod tests {
 
     // A redirect's Location may be protocol-relative or use a shouted scheme;
     // both are absolute, and treating either as a relative path sends the next
-    // hop to the wrong host.
+    // hop to the wrong host. Relative forms merge per RFC 3986 §5.3 (against
+    // the base's directory, not the host root); a root-only base merges to "/".
     #[test]
-    fn resolve_location_treats_absolute_forms_as_absolute() {
-        let base: Uri = "https://good.example/a/b".parse().unwrap();
-        assert_eq!(
-            resolve_location(&base, "//cdn.example/x").unwrap(),
-            "https://cdn.example/x"
-        );
-        assert_eq!(
-            resolve_location(&base, "HTTPS://other.example/x").unwrap(),
-            "HTTPS://other.example/x"
-        );
-        assert_eq!(
-            resolve_location(&base, "/rooted").unwrap(),
-            "https://good.example/rooted"
-        );
-        // RFC 3986 §5.3 merge: resolves against the base's directory
-        // ("/a/"), not the host root -- base is ".../a/b", so "relative"
-        // becomes ".../a/relative", not ".../relative".
-        assert_eq!(
-            resolve_location(&base, "relative").unwrap(),
-            "https://good.example/a/relative"
-        );
+    fn resolve_location_cases() {
+        let cases = [
+            (
+                "https://good.example/a/b",
+                "//cdn.example/x",
+                "https://cdn.example/x",
+            ),
+            (
+                "https://good.example/a/b",
+                "HTTPS://other.example/x",
+                "HTTPS://other.example/x",
+            ),
+            (
+                "https://good.example/a/b",
+                "https://other.example/x",
+                "https://other.example/x",
+            ),
+            (
+                "https://good.example/a/b",
+                "/rooted",
+                "https://good.example/rooted",
+            ),
+            (
+                "https://good.example/a/b",
+                "relative",
+                "https://good.example/a/relative",
+            ),
+            ("https://host.example", "rel", "https://host.example/rel"),
+        ];
+        for (base, loc, expected) in cases {
+            let base: Uri = base.parse().unwrap();
+            assert_eq!(resolve_location(&base, loc).unwrap(), expected, "{loc}");
+        }
     }
 
     #[test]
@@ -1537,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_filename_neutralizes_path_traversal() {
+    fn sanitize_filename_cases() {
         for bad in ["../../etc/passwd", "a/b", "..", ".", ""] {
             let result = sanitize_filename(bad);
             if let Ok(name) = &result {
@@ -1556,70 +1550,57 @@ mod tests {
         assert!(sanitize_filename("..").is_err());
         assert!(sanitize_filename(".").is_err());
         assert!(sanitize_filename("").is_err());
-    }
-
-    #[test]
-    fn sanitize_filename_keeps_safe_characters() {
+        // Safe names pass through unchanged.
         assert_eq!(sanitize_filename("kucsko2013").unwrap(), "kucsko2013");
         assert_eq!(sanitize_filename("smith-2024.v2").unwrap(), "smith-2024.v2");
     }
 
-    // Rejected before any network call is attempted -- a non-http(s) scheme
-    // (file://, javascript:, a bare path) from a third-party API is hostile
-    // input and must never reach an HTTP client.
-    #[test]
-    fn download_pdf_rejects_non_http_schemes() {
-        for bad in [
-            "file:///etc/passwd",
-            "ftp://example.com/x.pdf",
-            "javascript:alert(1)",
-        ] {
-            assert!(
-                download_pdf(bad, Duration::from_secs(1)).is_err(),
-                "expected {bad:?} to be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn pdf_magic_bytes_check() {
-        assert!(has_pdf_magic(b"%PDF-1.4\n..."));
-        assert!(!has_pdf_magic(b"<html><body>not a pdf</body></html>"));
-        assert!(!has_pdf_magic(b""));
-    }
-
     fn body_response(data: &str) -> Response<ureq::Body> {
         let body = ureq::Body::builder().data(data.as_bytes().to_vec());
-        ureq::http::Response::builder().status(200).body(body).unwrap()
+        ureq::http::Response::builder()
+            .status(200)
+            .body(body)
+            .unwrap()
     }
 
     // read_pdf_body's whole point: a non-PDF body is rejected off its first
-    // four bytes, without needing to read the rest -- no network here, so
-    // this only checks the classification, not that reading actually stops
-    // early (which `into_reader` doesn't expose a way to observe).
+    // four bytes -- no network here, so this only checks the classification.
     #[test]
-    fn read_pdf_body_rejects_a_non_pdf_body() {
-        let err = read_pdf_body(body_response("<html>not a pdf</html>"), 1000, "PDF download")
-            .unwrap_err();
-        assert!(err.contains("not a PDF"));
-    }
-
-    #[test]
-    fn read_pdf_body_rejects_a_body_shorter_than_the_magic_number() {
-        let err = read_pdf_body(body_response("%PD"), 1000, "PDF download").unwrap_err();
-        assert!(err.contains("not a PDF"));
-    }
-
-    #[test]
-    fn read_pdf_body_accepts_a_real_pdf_and_keeps_the_rest_of_the_bytes() {
-        let bytes = read_pdf_body(body_response("%PDF-1.4 rest of the file"), 1000, "x").unwrap();
-        assert_eq!(bytes, b"%PDF-1.4 rest of the file");
-    }
-
-    #[test]
-    fn read_pdf_body_enforces_the_byte_cap_after_the_magic_number() {
-        let err = read_pdf_body(body_response("%PDF0123456789"), 4, "x").unwrap_err();
-        assert!(err.contains("byte cap"));
+    fn read_pdf_body_cases() {
+        // (label, body, byte cap, Ok(bytes) | Err(message fragment))
+        let cases: [(&str, &str, u64, Result<&str, &str>); 4] = [
+            (
+                "non-pdf body",
+                "<html>not a pdf</html>",
+                1000,
+                Err("not a PDF"),
+            ),
+            (
+                "shorter than the magic number",
+                "%PD",
+                1000,
+                Err("not a PDF"),
+            ),
+            (
+                "real pdf keeps the rest",
+                "%PDF-1.4 rest of the file",
+                1000,
+                Ok("%PDF-1.4 rest of the file"),
+            ),
+            (
+                "cap enforced after the magic",
+                "%PDF0123456789",
+                4,
+                Err("byte cap"),
+            ),
+        ];
+        for (label, body, cap, expect) in cases {
+            let got = read_pdf_body(body_response(body), cap, "PDF download");
+            match expect {
+                Ok(bytes) => assert_eq!(got.unwrap(), bytes.as_bytes(), "{label}"),
+                Err(frag) => assert!(got.unwrap_err().contains(frag), "{label}"),
+            }
+        }
     }
 
     #[test]
@@ -1696,6 +1677,8 @@ mod tests {
         assert!(validate_url("http://127.0.0.1:8080/x").is_err());
         assert!(validate_url("http://169.254.169.254/latest/meta-data/").is_err());
         assert!(validate_url("not a url").is_err());
+        // download_pdf must validate before any network call.
+        assert!(download_pdf("file:///etc/passwd", Duration::from_secs(1)).is_err());
     }
 
     // Regression: `Uri::host()` keeps an IPv6 literal's brackets
@@ -1718,46 +1701,29 @@ mod tests {
     }
 
     #[test]
-    fn resolve_location_handles_absolute_and_relative() {
-        let base: Uri = "https://host.example/a/b".parse().unwrap();
-        assert_eq!(
-            resolve_location(&base, "https://other.example/x").unwrap(),
-            "https://other.example/x"
-        );
-        assert_eq!(
-            resolve_location(&base, "/root").unwrap(),
-            "https://host.example/root"
-        );
-        // RFC 3986 §5.3 merge, not root-append -- this is the case a real
-        // publisher's relative citation_pdf_url hits: base is ".../a/b",
-        // so "rel" resolves against the base's directory ".../a/", not the
-        // host root.
-        assert_eq!(
-            resolve_location(&base, "rel").unwrap(),
-            "https://host.example/a/rel"
-        );
-
-        // A base with no path segment beyond the root still merges sanely
-        // (the "/" fallback for a base path that resolves to just "/").
-        let root_base: Uri = "https://host.example".parse().unwrap();
-        assert_eq!(
-            resolve_location(&root_base, "rel").unwrap(),
-            "https://host.example/rel"
-        );
-    }
-
-    #[test]
     fn normalize_doi_strips_url_and_prefix() {
-        assert_eq!(normalize_doi("https://doi.org/10.1038/nature12373"), "10.1038/nature12373");
-        assert_eq!(normalize_doi(" http://dx.doi.org/10.1103/X.1?via=a#b "), "10.1103/X.1");
+        assert_eq!(
+            normalize_doi("https://doi.org/10.1038/nature12373"),
+            "10.1038/nature12373"
+        );
+        assert_eq!(
+            normalize_doi(" http://dx.doi.org/10.1103/X.1?via=a#b "),
+            "10.1103/X.1"
+        );
         assert_eq!(
             normalize_doi("https://onlinelibrary.wiley.com/doi/full/10.1002/abc.123"),
             "10.1002/abc.123"
         );
-        assert_eq!(normalize_doi("https://doi.org/10.1000%2Fxyz"), "10.1000/xyz");
+        assert_eq!(
+            normalize_doi("https://doi.org/10.1000%2Fxyz"),
+            "10.1000/xyz"
+        );
         assert_eq!(normalize_doi("DOI: 10.1000/xyz"), "10.1000/xyz");
         assert_eq!(normalize_doi("10.1000/xyz"), "10.1000/xyz");
-        assert_eq!(normalize_doi("https://example.com/paper"), "https://example.com/paper");
+        assert_eq!(
+            normalize_doi("https://example.com/paper"),
+            "https://example.com/paper"
+        );
     }
 
     #[test]
@@ -1900,10 +1866,7 @@ mod tests {
     fn pmh_id_shapes_that_are_not_a_pmc_record_are_ignored() {
         assert_eq!(pmcid_from_pmh_id("oai:arXiv.org:1902.11239"), None);
         assert_eq!(pmcid_from_pmh_id("oai:pubmedcentral.nih.gov:"), None);
-        assert_eq!(
-            pmcid_from_pmh_id("oai:pubmedcentral.nih.gov:abc"),
-            None
-        );
+        assert_eq!(pmcid_from_pmh_id("oai:pubmedcentral.nih.gov:abc"), None);
         assert_eq!(
             pmcid_from_pmh_id("oai:pubmedcentral.nih.gov:9131462"),
             Some("PMC9131462".to_string())
@@ -1930,62 +1893,36 @@ mod tests {
     </ListBucketResult>"#;
 
     #[test]
-    fn parse_pmc_versions_empty_listing_is_none() {
-        assert_eq!(
-            parse_pmc_versions(S3_NO_VERSIONS, "PMC6112690").unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_pmc_versions_single_version() {
-        assert_eq!(
-            parse_pmc_versions(S3_ONE_VERSION, "PMC9131462").unwrap(),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn parse_pmc_versions_two_versions_takes_the_max() {
-        assert_eq!(
-            parse_pmc_versions(S3_TWO_VERSIONS, "PMC10000341").unwrap(),
-            Some(2)
-        );
-    }
-
-    // S3 sorts keys as text, so version 10 lists before version 2 -- the
-    // numeric maximum (10) must win, not the last entry seen.
-    #[test]
-    fn parse_pmc_versions_takes_the_numeric_not_textual_maximum() {
-        let xml = r#"<ListBucketResult>
-            <Prefix>PMC1.</Prefix>
+    fn parse_pmc_versions_cases() {
+        // S3 sorts keys as text, so version 10 lists before version 2 -- the
+        // numeric maximum must win. A neighbouring id's prefix (PMC10000341
+        // contains PMC1000034 as a textual prefix) must be ignored, or
+        // PMC1000034 would silently download a different paper.
+        let ten_and_two = r#"<ListBucketResult><Prefix>PMC1.</Prefix>
             <CommonPrefixes><Prefix>PMC1.10/</Prefix></CommonPrefixes>
-            <CommonPrefixes><Prefix>PMC1.2/</Prefix></CommonPrefixes>
-        </ListBucketResult>"#;
-        assert_eq!(parse_pmc_versions(xml, "PMC1").unwrap(), Some(10));
-    }
-
-    // A neighbouring id's prefix (PMC10000341 contains PMC1000034 as a
-    // textual prefix, but not as "PMC1000034." followed by a version) must
-    // be ignored, or PMC1000034 would silently download a different paper.
-    #[test]
-    fn parse_pmc_versions_ignores_a_neighbouring_ids_prefix() {
-        let xml = r#"<ListBucketResult>
-            <Prefix>PMC1000034.</Prefix>
-            <CommonPrefixes><Prefix>PMC10000341.1/</Prefix></CommonPrefixes>
-        </ListBucketResult>"#;
-        assert_eq!(parse_pmc_versions(xml, "PMC1000034").unwrap(), None);
-    }
-
-    // L3: garbage (not a ListBucketResult at all -- an error page, a
-    // truncated body) must not be silently indistinguishable from a real
-    // empty listing. Both used to read as "no PDF here", the normal exit-0
-    // case; only a genuine empty-but-valid listing should.
-    #[test]
-    fn parse_pmc_versions_rejects_input_that_is_not_a_list_bucket_result() {
-        assert!(parse_pmc_versions("<html>Service Unavailable</html>", "PMC1").is_err());
-        assert!(parse_pmc_versions("", "PMC1").is_err());
-        assert!(parse_pmc_versions("not xml at all", "PMC1").is_err());
+            <CommonPrefixes><Prefix>PMC1.2/</Prefix></CommonPrefixes></ListBucketResult>"#;
+        let neighbour = r#"<ListBucketResult><Prefix>PMC1000034.</Prefix>
+            <CommonPrefixes><Prefix>PMC10000341.1/</Prefix></CommonPrefixes></ListBucketResult>"#;
+        let cases = [
+            ("empty listing", S3_NO_VERSIONS, "PMC6112690", None),
+            ("single version", S3_ONE_VERSION, "PMC9131462", Some(1)),
+            (
+                "two versions take the max",
+                S3_TWO_VERSIONS,
+                "PMC10000341",
+                Some(2),
+            ),
+            ("numeric not textual max", ten_and_two, "PMC1", Some(10)),
+            ("neighbouring id's prefix", neighbour, "PMC1000034", None),
+        ];
+        for (label, xml, id, expected) in cases {
+            assert_eq!(parse_pmc_versions(xml, id).unwrap(), expected, "{label}");
+        }
+        // L3: garbage (not a ListBucketResult at all) must not be silently
+        // indistinguishable from a real empty listing.
+        for bad in ["<html>Service Unavailable</html>", "", "not xml at all"] {
+            assert!(parse_pmc_versions(bad, "PMC1").is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -1999,123 +1936,128 @@ mod tests {
     }
 
     #[test]
-    fn arxiv_pdf_url_new_and_old_style_ids() {
-        assert_eq!(
-            arxiv_pdf_url("10.48550/arXiv.2301.00001").as_deref(),
-            Some("https://arxiv.org/pdf/2301.00001.pdf")
-        );
-        // Old-style id contains its own '/', which must survive intact.
-        assert_eq!(
-            arxiv_pdf_url("10.48550/arXiv.hep-th/9901001").as_deref(),
-            Some("https://arxiv.org/pdf/hep-th/9901001.pdf")
-        );
-        // Case-insensitive on the "arXiv." label.
-        assert_eq!(
-            arxiv_pdf_url("10.48550/ARXIV.2301.00001").as_deref(),
-            Some("https://arxiv.org/pdf/2301.00001.pdf")
-        );
+    fn preprint_server_pdf_urls() {
+        type F = fn(&str) -> Option<String>;
+        // (label, resolver, doi, expected). Case-insensitive on the labels
+        // throughout (DOIs are case-insensitive); preprints.org once matched
+        // its prefix case-sensitively and missed a capitalized DOI.
+        let cases: [(&str, F, &str, Option<&str>); 13] = [
+            (
+                "arxiv new",
+                arxiv_pdf_url,
+                "10.48550/arXiv.2301.00001",
+                Some("https://arxiv.org/pdf/2301.00001.pdf"),
+            ),
+            // Old-style id contains its own '/', which must survive intact.
+            (
+                "arxiv old",
+                arxiv_pdf_url,
+                "10.48550/arXiv.hep-th/9901001",
+                Some("https://arxiv.org/pdf/hep-th/9901001.pdf"),
+            ),
+            (
+                "arxiv case",
+                arxiv_pdf_url,
+                "10.48550/ARXIV.2301.00001",
+                Some("https://arxiv.org/pdf/2301.00001.pdf"),
+            ),
+            (
+                "arxiv non-arxiv",
+                arxiv_pdf_url,
+                "10.1038/nature12373",
+                None,
+            ),
+            ("arxiv empty id", arxiv_pdf_url, "10.48550/arXiv.", None),
+            (
+                "osf",
+                osf_pdf_url,
+                "10.31219/osf.io/abc12",
+                Some("https://osf.io/abc12/download"),
+            ),
+            // PsyArXiv: a different registrar prefix, same /osf.io/ segment.
+            (
+                "osf psyarxiv",
+                osf_pdf_url,
+                "10.31234/osf.io/xyz98",
+                Some("https://osf.io/xyz98/download"),
+            ),
+            // Versioned: the guid must come out bare, not with "_v1" attached.
+            (
+                "osf versioned",
+                osf_pdf_url,
+                "10.31219/osf.io/abc12_v1",
+                Some("https://osf.io/abc12/download"),
+            ),
+            ("osf non-osf", osf_pdf_url, "10.1038/nature12373", None),
+            (
+                "preprints",
+                preprints_org_pdf_url,
+                "10.20944/preprints202001.0001.v1",
+                Some("https://www.preprints.org/manuscript/202001.0001/v1/download"),
+            ),
+            (
+                "preprints case",
+                preprints_org_pdf_url,
+                "10.20944/Preprints202001.0001.V1",
+                Some("https://www.preprints.org/manuscript/202001.0001/v1/download"),
+            ),
+            (
+                "preprints non-preprints",
+                preprints_org_pdf_url,
+                "10.1038/nature12373",
+                None,
+            ),
+            (
+                "preprints no version",
+                preprints_org_pdf_url,
+                "10.20944/preprints202001.0001",
+                None,
+            ),
+        ];
+        for (label, f, doi, expected) in cases {
+            assert_eq!(f(doi).as_deref(), expected, "{label}");
+        }
     }
 
     #[test]
-    fn arxiv_pdf_url_rejects_non_arxiv_dois() {
-        assert_eq!(arxiv_pdf_url("10.1038/nature12373"), None);
-        assert_eq!(arxiv_pdf_url("10.48550/arXiv."), None); // empty id
-    }
-
-    #[test]
-    fn osf_pdf_url_covers_every_osf_hosted_server() {
-        assert_eq!(
-            osf_pdf_url("10.31219/osf.io/abc12").as_deref(),
-            Some("https://osf.io/abc12/download")
-        );
-        // PsyArXiv: a different registrar prefix, same /osf.io/ segment.
-        assert_eq!(
-            osf_pdf_url("10.31234/osf.io/xyz98").as_deref(),
-            Some("https://osf.io/xyz98/download")
-        );
-        // Versioned: the guid must come out bare, not with "_v1" attached.
-        assert_eq!(
-            osf_pdf_url("10.31219/osf.io/abc12_v1").as_deref(),
-            Some("https://osf.io/abc12/download")
-        );
-    }
-
-    #[test]
-    fn osf_pdf_url_rejects_non_osf_dois() {
-        assert_eq!(osf_pdf_url("10.1038/nature12373"), None);
-    }
-
-    #[test]
-    fn preprints_org_pdf_url_splits_manuscript_and_version() {
-        assert_eq!(
-            preprints_org_pdf_url("10.20944/preprints202001.0001.v1").as_deref(),
-            Some("https://www.preprints.org/manuscript/202001.0001/v1/download")
-        );
-    }
-
-    // Case-insensitive on the "preprints"/".v" labels, the same as
-    // arxiv_pdf_url and osf_pdf_url are on theirs -- DOIs are case-insensitive
-    // by the DOI system's own spec. Regression: an earlier version matched
-    // the prefix case-sensitively and silently missed a capitalized DOI.
-    #[test]
-    fn preprints_org_pdf_url_is_case_insensitive() {
-        assert_eq!(
-            preprints_org_pdf_url("10.20944/Preprints202001.0001.V1").as_deref(),
-            Some("https://www.preprints.org/manuscript/202001.0001/v1/download")
-        );
-    }
-
-    #[test]
-    fn preprints_org_pdf_url_rejects_non_preprints_org_dois() {
-        assert_eq!(preprints_org_pdf_url("10.1038/nature12373"), None);
-        assert_eq!(preprints_org_pdf_url("10.20944/preprints202001.0001"), None); // no .v<version>
-    }
-
-    // Real shape (trimmed) from GET api.biorxiv.org/details/biorxiv/<doi>: a
-    // multi-version posting, highest version wins.
-    #[test]
-    fn parse_biorxiv_details_picks_the_highest_version() {
-        let json = r#"
-        {"collection":[
-            {"doi":"10.1101/2020.01.01.900000","version":"1"},
-            {"doi":"10.1101/2020.01.01.900000","version":"2"}
-        ],"messages":[{"status":"ok","count":"2"}]}
-        "#;
-        assert_eq!(parse_biorxiv_details(json).unwrap(), Some(2));
-    }
-
-    // "no posts found" shape: no `collection` key at all. Must be Ok(None),
-    // not an error or a panic -- this is bioRxiv's own real "not found"
-    // response.
-    #[test]
-    fn parse_biorxiv_details_no_collection_key_is_none() {
-        let json = r#"{"messages":[{"status":"no posts found matching the DOI"}]}"#;
-        assert_eq!(parse_biorxiv_details(json).unwrap(), None);
-    }
-
-    // An empty collection array is the same "not found" case as a missing key.
-    #[test]
-    fn parse_biorxiv_details_empty_collection_is_none() {
-        let json = r#"{"collection":[],"messages":[{"status":"ok","count":"0"}]}"#;
-        assert_eq!(parse_biorxiv_details(json).unwrap(), None);
-    }
-
-    // A non-numeric version on one item is just skipped, not garbage --
-    // the rest of the response is still a well-formed collection.
-    #[test]
-    fn parse_biorxiv_details_a_non_numeric_version_is_skipped_not_an_error() {
-        let json = r#"{"collection":[{"version":"not-a-number"},{"version":"3"}]}"#;
-        assert_eq!(parse_biorxiv_details(json).unwrap(), Some(3));
-    }
-
-    // L3: malformed JSON, or a "collection" field of the wrong type, is not
-    // a real "not found" answer -- it must be Err, not silently None, or a
-    // network blip/API change reads as "no PDF anywhere" (fetch's clean
-    // exit 0) instead of the error it actually is.
-    #[test]
-    fn parse_biorxiv_details_rejects_unparseable_input() {
-        assert!(parse_biorxiv_details("not json").is_err());
-        assert!(parse_biorxiv_details(r#"{"collection":"oops"}"#).is_err());
-        assert!(parse_biorxiv_details(r#"{"collection":42}"#).is_err());
+    fn parse_biorxiv_details_cases() {
+        let cases = [
+            // Real shape (trimmed): a multi-version posting, highest wins.
+            (
+                "highest version",
+                r#"{"collection":[{"doi":"10.1101/x","version":"1"},{"doi":"10.1101/x","version":"2"}],"messages":[{"status":"ok","count":"2"}]}"#,
+                Some(2),
+            ),
+            // bioRxiv's real "not found" shape: no `collection` key at all.
+            (
+                "no collection key",
+                r#"{"messages":[{"status":"no posts found matching the DOI"}]}"#,
+                None,
+            ),
+            // An empty collection array is the same "not found" case.
+            (
+                "empty collection",
+                r#"{"collection":[],"messages":[{"status":"ok","count":"0"}]}"#,
+                None,
+            ),
+            // A non-numeric version on one item is skipped, not an error.
+            (
+                "non-numeric version skipped",
+                r#"{"collection":[{"version":"not-a-number"},{"version":"3"}]}"#,
+                Some(3),
+            ),
+        ];
+        for (label, json, expected) in cases {
+            assert_eq!(parse_biorxiv_details(json).unwrap(), expected, "{label}");
+        }
+        // L3: malformed JSON or a wrongly-typed "collection" is Err, not a
+        // silent "not found".
+        for bad in [
+            "not json",
+            r#"{"collection":"oops"}"#,
+            r#"{"collection":42}"#,
+        ] {
+            assert!(parse_biorxiv_details(bad).is_err(), "{bad}");
+        }
     }
 }
